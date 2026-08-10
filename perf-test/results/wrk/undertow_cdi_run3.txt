@@ -1,0 +1,13 @@
+Running 15s test @ http://localhost:8080/cdi
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   461.49us  464.00us  10.50ms   90.95%
+    Req/Sec    63.14k     3.25k   70.03k    68.17%
+  Latency Distribution
+     50%  317.00us
+     75%  517.00us
+     90%    0.88ms
+     99%    2.62ms
+  3769177 requests in 15.01s, 334.29MB read
+Requests/sec: 251044.83
+Transfer/sec:     22.27MB

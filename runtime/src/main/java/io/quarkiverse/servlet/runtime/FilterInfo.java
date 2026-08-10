@@ -15,6 +15,7 @@ public class FilterInfo {
     private final String className;
     private final Map<String, String> initParams;
     private final int priority;
+    private final boolean asyncSupported;
     private final List<FilterMapping> mappings = new ArrayList<>();
     private Filter filter;
 
@@ -26,6 +27,13 @@ public class FilterInfo {
     public FilterInfo(String name, String className, List<String> urlPatterns,
             List<String> servletNames, Set<DispatcherType> dispatcherTypes,
             Map<String, String> initParams, int priority) {
+        this(name, className, urlPatterns, servletNames, dispatcherTypes, initParams, priority, true);
+    }
+
+    public FilterInfo(String name, String className, List<String> urlPatterns,
+            List<String> servletNames, Set<DispatcherType> dispatcherTypes,
+            Map<String, String> initParams, int priority, boolean asyncSupported) {
+        this.asyncSupported = asyncSupported;
         this.name = name;
         this.className = className;
         this.initParams = initParams;
@@ -48,6 +56,14 @@ public class FilterInfo {
                 urlPatterns != null ? urlPatterns : List.of(),
                 servletNames != null ? servletNames : List.of(),
                 types));
+    }
+
+    /**
+     * Whether this filter declared async support. A request only supports async when every filter
+     * in its chain and the target servlet all do.
+     */
+    public boolean isAsyncSupported() {
+        return asyncSupported;
     }
 
     public String getName() {

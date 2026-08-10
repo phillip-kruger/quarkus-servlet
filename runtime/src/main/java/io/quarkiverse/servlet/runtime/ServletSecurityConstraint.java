@@ -34,12 +34,19 @@ public class ServletSecurityConstraint {
     }
 
     public boolean matchesUrl(String path) {
+        return urlSpecificity(path) >= 0;
+    }
+
+    /**
+     * How specifically this constraint's most specific matching pattern matches {@code path}, or
+     * {@code -1} when none of its patterns match.
+     */
+    public int urlSpecificity(String path) {
+        int best = -1;
         for (String pattern : urlPatterns) {
-            if (UrlPatternMatcher.matches(pattern, path)) {
-                return true;
-            }
+            best = Math.max(best, UrlPatternMatcher.specificity(pattern, path));
         }
-        return false;
+        return best;
     }
 
     public boolean matchesMethod(String method) {
@@ -58,6 +65,18 @@ public class ServletSecurityConstraint {
 
     public Set<String> getRolesAllowed() {
         return rolesAllowed;
+    }
+
+    // These two are read by matchesMethod above, so nothing in this class needs them. They exist
+    // because the Quarkus bytecode recorder reconstructs this object from its constructor and
+    // reads each parameter's value through the matching getter - without them, recording a
+    // <security-constraint> fails the build outright.
+    public Set<String> getHttpMethods() {
+        return httpMethods;
+    }
+
+    public Set<String> getHttpMethodOmissions() {
+        return httpMethodOmissions;
     }
 
     public EmptyRoleSemantic getEmptyRoleSemantic() {

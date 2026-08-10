@@ -116,6 +116,11 @@ public class VertxRequestDispatcher implements RequestDispatcher {
 
         FilterInfo[] filters = deployment.getMatchingFilters(
                 targetPath, target.getName(), DispatcherType.FORWARD);
+        // Async support belongs to the chain actually handling the request, so it is recomputed
+        // for the forward target rather than inherited from the forwarding servlet.
+        if (vsr != null) {
+            vsr.setAsyncSupported(ServletDeployment.isAsyncSupported(target, filters));
+        }
         VertxFilterChain chain = new VertxFilterChain(filters, target);
         try {
             chain.doFilter(request, response);
@@ -196,6 +201,9 @@ public class VertxRequestDispatcher implements RequestDispatcher {
         try {
             FilterInfo[] includeFilters = deployment.getMatchingFilters(
                     targetPath, target.getName(), DispatcherType.INCLUDE);
+            if (vsr != null) {
+                vsr.setAsyncSupported(ServletDeployment.isAsyncSupported(target, includeFilters));
+            }
             VertxFilterChain includeChain = new VertxFilterChain(includeFilters, target);
             includeChain.doFilter(request, wrappedResponse);
         } finally {

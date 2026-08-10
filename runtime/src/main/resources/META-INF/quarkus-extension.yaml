@@ -10,5 +10,8 @@ metadata:
   categories:
     - "web"
   status: "experimental"
+  capabilities:
+    provides:
+      - "io.quarkus.servlet"
   config:
     - "quarkus.servlet."

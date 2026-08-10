@@ -75,6 +75,32 @@ public class UrlPatternMatcher {
         return null;
     }
 
+    /**
+     * Ranks how specifically {@code pattern} matches {@code requestPath}, following the servlet
+     * mapping precedence rules: exact beats longest path prefix, which beats extension, which beats
+     * the default mapping. Returns {@code -1} when the pattern does not match at all.
+     * <p>
+     * Security constraints are selected with this rather than declaration order, so that a
+     * {@code /*} constraint cannot override a more specific {@code /admin/*} one just by being
+     * declared first.
+     */
+    public static int specificity(String pattern, String requestPath) {
+        if (!matches(pattern, requestPath)) {
+            return -1;
+        }
+        if ("/".equals(pattern) || "/*".equals(pattern)) {
+            return 0;
+        }
+        if (pattern.startsWith("*.")) {
+            return 1;
+        }
+        if (pattern.endsWith("/*")) {
+            // longer prefixes are more specific; offset keeps them above extension matches
+            return 1000 + (pattern.length() - 2);
+        }
+        return 1_000_000;
+    }
+
     public static boolean matches(String pattern, String requestPath) {
         if ("/".equals(pattern) || "/*".equals(pattern)) {
             return true;

@@ -60,7 +60,7 @@ public class VertxServletContext implements ServletContext {
     private boolean inListenerContext;
     private final Map<String, SimpleServletRegistration> servletRegistrations = new LinkedHashMap<>();
     private final Map<String, SimpleFilterRegistration> filterRegistrations = new LinkedHashMap<>();
-    private final SimpleSessionCookieConfig sessionCookieConfig = new SimpleSessionCookieConfig();
+    private final SimpleSessionCookieConfig sessionCookieConfig = new SimpleSessionCookieConfig(this);
     private Set<SessionTrackingMode> sessionTrackingModes;
     private final Set<String> declaredRoles = new HashSet<>();
 
@@ -592,6 +592,14 @@ public class VertxServletContext implements ServletContext {
         return sessionCookieConfig;
     }
 
+    /**
+     * The session cookie configuration, without the programmatic-access restriction that applies to
+     * applications. Used by the container itself when it issues the session cookie.
+     */
+    public SimpleSessionCookieConfig sessionCookieConfig() {
+        return sessionCookieConfig;
+    }
+
     @Override
     public void setSessionTrackingModes(Set<SessionTrackingMode> sessionTrackingModes) {
         checkInitializationPhase();
@@ -719,6 +727,16 @@ public class VertxServletContext implements ServletContext {
     @Override
     public void setSessionTimeout(int sessionTimeout) {
         checkInitializationPhase();
+        this.sessionTimeout = sessionTimeout;
+    }
+
+    /**
+     * Applies the deployment descriptor's {@code <session-config>}. This is the container
+     * configuring itself, not application code calling {@link #setSessionTimeout(int)}, so it is
+     * not subject to the initialization-phase check - it runs while the deployment is still being
+     * assembled, before the context exists as far as the application is concerned.
+     */
+    public void setDeploymentSessionTimeout(int sessionTimeout) {
         this.sessionTimeout = sessionTimeout;
     }
 
@@ -1128,6 +1146,12 @@ public class VertxServletContext implements ServletContext {
 
     public static class SimpleSessionCookieConfig implements SessionCookieConfig {
 
+        /**
+         * The owning context, consulted so that the setters can refuse changes once the context has
+         * finished initializing - the spec requires IllegalStateException at that point.
+         */
+        private final VertxServletContext owner;
+
         private String name = "JSESSIONID";
         private String domain;
         private String path;
@@ -1137,8 +1161,19 @@ public class VertxServletContext implements ServletContext {
         private int maxAge = -1;
         private final Map<String, String> attributes = new LinkedHashMap<>();
 
+        SimpleSessionCookieConfig(VertxServletContext owner) {
+            this.owner = owner;
+        }
+
+        private void checkMutable() {
+            if (owner != null) {
+                owner.checkInitializationPhase();
+            }
+        }
+
         @Override
         public void setName(String name) {
+            checkMutable();
             this.name = name;
         }
 
@@ -1149,6 +1184,7 @@ public class VertxServletContext implements ServletContext {
 
         @Override
         public void setDomain(String domain) {
+            checkMutable();
             this.domain = domain;
         }
 
@@ -1159,6 +1195,7 @@ public class VertxServletContext implements ServletContext {
 
         @Override
         public void setPath(String path) {
+            checkMutable();
             this.path = path;
         }
 
@@ -1170,6 +1207,7 @@ public class VertxServletContext implements ServletContext {
         @Override
         @SuppressWarnings("removal")
         public void setComment(String comment) {
+            checkMutable();
             this.comment = comment;
         }
 
@@ -1181,6 +1219,7 @@ public class VertxServletContext implements ServletContext {
 
         @Override
         public void setHttpOnly(boolean httpOnly) {
+            checkMutable();
             this.httpOnly = httpOnly;
         }
 
@@ -1191,6 +1230,7 @@ public class VertxServletContext implements ServletContext {
 
         @Override
         public void setSecure(boolean secure) {
+            checkMutable();
             this.secure = secure;
         }
 
@@ -1201,6 +1241,7 @@ public class VertxServletContext implements ServletContext {
 
         @Override
         public void setMaxAge(int maxAge) {
+            checkMutable();
             this.maxAge = maxAge;
         }
 
@@ -1211,6 +1252,7 @@ public class VertxServletContext implements ServletContext {
 
         @Override
         public void setAttribute(String name, String value) {
+            checkMutable();
             attributes.put(name, value);
         }
 

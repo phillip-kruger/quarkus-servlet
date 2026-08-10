@@ -13,17 +13,6 @@ import io.smallrye.config.WithDefault;
 public interface ServletRuntimeConfig {
 
     /**
-     * The default buffer size for servlet output streams.
-     */
-    @WithDefault("8192")
-    int bufferSize();
-
-    /**
-     * The default character encoding for servlet requests and responses.
-     */
-    Optional<String> defaultCharset();
-
-    /**
      * The maximum number of HTTP request parameters. If a request contains
      * more parameters than this limit, a 400 Bad Request is returned.
      */
@@ -36,11 +25,34 @@ public interface ServletRuntimeConfig {
     Optional<Set<String>> disallowedMethods();
 
     /**
-     * If true, all servlets run on virtual threads by default. Individual servlets
-     * can still opt in with {@code @RunOnVirtualThread} when this is false (the default),
-     * or this can be set to true to run all servlets on virtual threads without
-     * annotating each one.
+     * The thread servlets run on when they do not declare one themselves.
+     * <p>
+     * {@code event-loop} is the fastest and is safe only for servlets that never block.
+     * {@code worker} matches the behaviour of traditional servlet containers and is safe for
+     * arbitrary blocking code. {@code virtual-thread} runs every servlet on a virtual thread.
+     * <p>
+     * Individual servlets override this with {@code @NonBlocking}, {@code @Blocking} or
+     * {@code @RunOnVirtualThread}.
      */
+    @WithDefault("event-loop")
+    ExecutionModel executionModel();
+
+    /**
+     * If true, all servlets run on virtual threads by default.
+     *
+     * @deprecated use {@code quarkus.servlet.execution-model=virtual-thread} instead. When set,
+     *             this still wins over {@code execution-model} so existing configuration keeps
+     *             working.
+     */
+    @Deprecated
     @WithDefault("false")
     boolean virtualThreads();
+
+    /**
+     * The deployment-wide execution model, taking the deprecated {@code virtual-threads} flag into
+     * account.
+     */
+    default ExecutionModel defaultExecutionModel() {
+        return virtualThreads() ? ExecutionModel.VIRTUAL_THREAD : executionModel();
+    }
 }

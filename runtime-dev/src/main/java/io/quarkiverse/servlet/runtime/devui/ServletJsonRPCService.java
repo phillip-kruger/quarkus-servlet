@@ -40,7 +40,8 @@ public class ServletJsonRPCService {
                     .put("mappings", new JsonArray(info.getMappings()))
                     .put("loadOnStartup", info.getLoadOnStartup())
                     .put("asyncSupported", info.isAsyncSupported())
-                    .put("runOnVirtualThread", info.isRunOnVirtualThread())
+                    .put("executionModel", String.valueOf(
+                            info.getExecutionModel(dep.getDefaultExecutionModel())))
                     .put("initialized", info.isInitialized())
                     .put("initFailed", info.isInitFailed()));
         }

@@ -1,8 +1,7 @@
 package io.quarkiverse.servlet.runtime;
 
-import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import jakarta.servlet.AsyncContext;
@@ -19,41 +18,99 @@ import org.jboss.logging.Logger;
 
 import io.vertx.core.Vertx;
 
+/**
+ * {@link AsyncContext} implementation.
+ * <p>
+ * Nothing here ever blocks the calling thread. When a servlet starts async processing its
+ * {@code service()} method returns normally, the container leaves the HTTP response open, and the
+ * exchange is finished later by {@link #complete()} or by the servlet invoked through
+ * {@link #dispatch()}. That is what makes async usable while servlets run on the event loop.
+ */
 public class VertxAsyncContext implements AsyncContext {
 
     private static final Logger log = Logger.getLogger(VertxAsyncContext.class);
 
+    /**
+     * Hooks back into the container, supplied by the code that is driving the request.
+     */
+    public interface Callbacks {
+
+        /**
+         * Runs {@code action} on the thread this request's servlet executes on, with the CDI
+         * request context and servlet request context active for its duration.
+         */
+        void execute(Runnable action);
+
+        /**
+         * Finishes the exchange: closes the response and releases request-scoped state. Must be
+         * idempotent.
+         */
+        void finish();
+    }
+
+    private record Registration(AsyncListener listener, ServletRequest request, ServletResponse response) {
+
+        AsyncEvent event(AsyncContext ctx, Throwable throwable) {
+            return new AsyncEvent(ctx, request, response, throwable);
+        }
+    }
+
     private final ServletRequest request;
     private final ServletResponse response;
+    /** The container's own request, kept because {@link #dispatch()} may have to fall back to it. */
+    private final HttpServletRequest containerRequest;
     private final boolean originalRequestAndResponse;
-    private final List<AsyncListener> listeners = new ArrayList<>();
-    private long timeout = 30000;
-    private final AtomicBoolean completed = new AtomicBoolean(false);
-    private final AtomicBoolean dispatched = new AtomicBoolean(false);
-    private final CountDownLatch completionLatch = new CountDownLatch(1);
-    private Long timerId;
+    private final List<Registration> listeners = new CopyOnWriteArrayList<>();
     private final Vertx vertx;
     private final ServletDeployment deployment;
 
+    private volatile long timeout = 30000;
+    private volatile Long timerId;
+    private volatile Callbacks callbacks;
+    private volatile String dispatchPath;
+
+    private final AtomicBoolean completed = new AtomicBoolean();
+    private final AtomicBoolean dispatchRequested = new AtomicBoolean();
+    private final AtomicBoolean dispatchStarted = new AtomicBoolean();
+    private final AtomicBoolean serviceReturned = new AtomicBoolean();
+    private final AtomicBoolean finished = new AtomicBoolean();
+
     public VertxAsyncContext(ServletRequest request, ServletResponse response,
-            boolean originalRequestAndResponse, Vertx vertx, ServletDeployment deployment) {
+            HttpServletRequest containerRequest, boolean originalRequestAndResponse,
+            Vertx vertx, ServletDeployment deployment) {
         this.request = request;
         this.response = response;
+        this.containerRequest = containerRequest;
         this.originalRequestAndResponse = originalRequestAndResponse;
         this.vertx = vertx;
         this.deployment = deployment;
     }
 
+    public void setCallbacks(Callbacks callbacks) {
+        this.callbacks = callbacks;
+    }
+
     public void startTimeout() {
-        if (timeout > 0 && vertx != null) {
-            timerId = vertx.setTimer(timeout, id -> {
-                if (!completed.get() && !dispatched.get()) {
-                    vertx.executeBlocking(() -> {
-                        onTimeout();
-                        return null;
-                    });
-                }
-            });
+        cancelTimeout();
+        long t = timeout;
+        if (t > 0 && vertx != null) {
+            timerId = vertx.setTimer(t, id -> onTimeoutFired());
+        }
+    }
+
+    /**
+     * Signals that the servlet's {@code service()} method has returned while async is still active.
+     * A dispatch requested from within {@code service()} only runs once that has happened, as the
+     * spec requires.
+     */
+    public void onServiceReturned() {
+        serviceReturned.set(true);
+        if (dispatchRequested.get() && !completed.get()) {
+            scheduleDispatch();
+        } else if (completed.get()) {
+            // complete() was called from inside service(); the exchange is only really finished
+            // now that control has come back to the container.
+            finishNow();
         }
     }
 
@@ -74,14 +131,21 @@ public class VertxAsyncContext implements AsyncContext {
 
     @Override
     public void dispatch() {
-        HttpServletRequest httpReq = (HttpServletRequest) request;
+        // Servlet 6.1, 2.3.3.3: the target is the URI of the request the application passed to
+        // startAsync, but only when that request is an HttpServletRequest. An application is free
+        // to wrap with a plain ServletRequestWrapper, and then the dispatch goes to the URI of the
+        // request as the container last dispatched it.
+        HttpServletRequest httpReq = request instanceof HttpServletRequest httpRequest
+                ? httpRequest
+                : containerRequest;
         String path = httpReq.getRequestURI();
         String contextPath = httpReq.getContextPath();
         if (contextPath != null && !contextPath.isEmpty() && !"/".equals(contextPath)
                 && path.startsWith(contextPath)) {
             path = path.substring(contextPath.length());
         }
-        dispatch(httpReq.getServletContext(), path);
+        String query = httpReq.getQueryString();
+        dispatch(httpReq.getServletContext(), query != null ? path + "?" + query : path);
     }
 
     @Override
@@ -91,137 +155,167 @@ public class VertxAsyncContext implements AsyncContext {
 
     @Override
     public void dispatch(ServletContext context, String path) {
-        if (dispatched.getAndSet(true)) {
+        if (completed.get()) {
+            throw new IllegalStateException("Async processing has already completed");
+        }
+        if (dispatchRequested.getAndSet(true)) {
             throw new IllegalStateException("Async dispatch already in progress");
         }
         cancelTimeout();
-        dispatchPath = path;
+        this.dispatchPath = path;
+        if (serviceReturned.get()) {
+            scheduleDispatch();
+        }
     }
 
-    private volatile String dispatchPath;
-
     public boolean isDispatched() {
-        return dispatched.get();
+        return dispatchRequested.get();
     }
 
     public boolean isCompleted() {
         return completed.get();
     }
 
-    public void executeDispatch() {
-        if (dispatchPath != null) {
-            doDispatch(dispatchPath);
+    private void scheduleDispatch() {
+        if (dispatchStarted.getAndSet(true)) {
+            return;
         }
+        Callbacks cb = callbacks;
+        if (cb == null) {
+            log.error("Async dispatch requested before the container attached its callbacks");
+            return;
+        }
+        cb.execute(this::runDispatch);
     }
 
-    private void doDispatch(String path) {
+    private void runDispatch() {
+        String path = dispatchPath;
         try {
-            if (deployment == null) {
+            if (deployment == null || path == null) {
                 complete();
                 return;
             }
 
-            String dispatchPath = path;
-            String dispatchQueryString = null;
-            int queryIdx = dispatchPath.indexOf('?');
+            String targetPath = path;
+            String queryString = null;
+            int queryIdx = targetPath.indexOf('?');
             if (queryIdx >= 0) {
-                dispatchQueryString = dispatchPath.substring(queryIdx + 1);
-                dispatchPath = dispatchPath.substring(0, queryIdx);
+                queryString = targetPath.substring(queryIdx + 1);
+                targetPath = targetPath.substring(0, queryIdx);
             }
-            int semiIdx = dispatchPath.indexOf(';');
+            int semiIdx = targetPath.indexOf(';');
             if (semiIdx >= 0) {
-                dispatchPath = dispatchPath.substring(0, semiIdx);
+                targetPath = targetPath.substring(0, semiIdx);
             }
 
-            UrlPatternMatcher.MatchResult match = deployment.matchServlet(dispatchPath);
+            UrlPatternMatcher.MatchResult match = deployment.matchServlet(targetPath);
             if (match == null) {
+                if (response instanceof VertxServletResponse vsr) {
+                    vsr.sendError(404);
+                }
                 complete();
                 return;
             }
 
             deployment.ensureServletInitialized(match.getServletInfo());
 
-            if (request instanceof VertxServletRequest vsr) {
+            // The application may have handed startAsync() a wrapper, but the container state
+            // lives on the request underneath it.
+            VertxServletRequest vsr = unwrap(request);
+            if (vsr != null) {
                 vsr.setDispatcherType(DispatcherType.ASYNC);
                 vsr.resetAsyncState();
-                vsr.setAsyncSupported(match.getServletInfo().isAsyncSupported());
-                if (dispatchQueryString != null) {
-                    vsr.setDispatchQueryString(dispatchQueryString);
+                if (queryString != null) {
+                    vsr.setDispatchQueryString(queryString);
                 }
 
-                request.setAttribute(ASYNC_REQUEST_URI,
-                        vsr.getContextPath() + dispatchPath);
+                request.setAttribute(ASYNC_REQUEST_URI, vsr.getContextPath() + targetPath);
                 request.setAttribute(ASYNC_CONTEXT_PATH, vsr.getContextPath());
                 request.setAttribute(ASYNC_SERVLET_PATH, match.getServletPath());
                 request.setAttribute(ASYNC_PATH_INFO, match.getPathInfo());
-                request.setAttribute(ASYNC_QUERY_STRING, dispatchQueryString);
+                request.setAttribute(ASYNC_QUERY_STRING, queryString);
             }
 
             FilterInfo[] filters = deployment.getMatchingFilters(
-                    dispatchPath, match.getServletInfo().getName(),
-                    DispatcherType.ASYNC);
-            VertxFilterChain chain = new VertxFilterChain(filters, match.getServletInfo());
-            chain.doFilter(request, response);
+                    targetPath, match.getServletInfo().getName(), DispatcherType.ASYNC);
+            if (vsr != null) {
+                vsr.setAsyncSupported(
+                        ServletDeployment.isAsyncSupported(match.getServletInfo(), filters));
+            }
 
-            if (request instanceof VertxServletRequest vsr && vsr.isAsyncStarted()) {
-                VertxAsyncContext nextAc = (VertxAsyncContext) vsr.getAsyncContext();
-                if (nextAc.isDispatched()) {
-                    nextAc.executeDispatch();
-                } else if (!nextAc.isCompleted()) {
-                    try {
-                        nextAc.awaitCompletion();
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                    }
-                }
-                closeResponse();
-                completionLatch.countDown();
+            // While the dispatched servlet runs, the request is back "inside" service() as far as
+            // the spec is concerned, so a complete() from within it must not close the response
+            // out from under it.
+            serviceReturned.set(false);
+            try {
+                new VertxFilterChain(filters, match.getServletInfo()).doFilter(request, response);
+            } finally {
+                serviceReturned.set(true);
+            }
+
+            // The dispatched servlet may itself have started async processing again; if it did, the
+            // new AsyncContext owns the exchange from here and we must not finish it.
+            if (vsr != null && vsr.isAsyncStarted()) {
+                VertxAsyncContext next = (VertxAsyncContext) vsr.getAsyncContext();
+                next.onServiceReturned();
                 return;
             }
 
-            complete();
+            if (completed.get()) {
+                finishNow();
+            } else {
+                complete();
+            }
         } catch (Exception e) {
             log.error("Error during async dispatch", e);
-            onError(e);
+            notifyError(e);
             if (!completed.get()) {
+                if (response instanceof VertxServletResponse vsr && !vsr.isCommitted()) {
+                    try {
+                        vsr.sendError(500);
+                    } catch (Exception ignored) {
+                        // the response is already going away; nothing useful left to do
+                    }
+                }
                 complete();
             }
         }
     }
 
+    /**
+     * {@inheritDoc}
+     * <p>
+     * When called from inside {@code service()} the response is deliberately left open until the
+     * servlet returns: the spec keeps the request in async mode "until the dispatch returns to the
+     * container", and applications legitimately write to the response after calling this.
+     */
     @Override
     public void complete() {
         if (completed.getAndSet(true)) {
             return;
         }
         cancelTimeout();
+        if (serviceReturned.get()) {
+            finishNow();
+        }
+    }
 
-        AsyncEvent event = new AsyncEvent(this, request, response);
-        for (AsyncListener listener : listeners) {
+    private void finishNow() {
+        if (finished.getAndSet(true)) {
+            return;
+        }
+        for (Registration reg : listeners) {
             try {
-                listener.onComplete(event);
+                reg.listener().onComplete(reg.event(this, null));
             } catch (Exception e) {
                 log.warn("Error in AsyncListener.onComplete", e);
             }
         }
 
-        // Fire request destroyed listeners (skipped by executeServletInternal for async)
-        if (deployment != null && request instanceof VertxServletRequest) {
-            var ctxListeners = deployment.getServletContext().getListeners();
-            for (int i = ctxListeners.size() - 1; i >= 0; i--) {
-                if (ctxListeners.get(i) instanceof jakarta.servlet.ServletRequestListener srl) {
-                    srl.requestDestroyed(
-                            new jakarta.servlet.ServletRequestEvent(deployment.getServletContext(), request));
-                }
-            }
+        Callbacks cb = callbacks;
+        if (cb != null) {
+            cb.finish();
         }
-
-        // Response close is handled by executeServletInternal or doDispatch
-        completionLatch.countDown();
-    }
-
-    public void awaitCompletion() throws InterruptedException {
-        completionLatch.await();
     }
 
     @Override
@@ -230,7 +324,7 @@ public class VertxAsyncContext implements AsyncContext {
             vertx.executeBlocking(() -> {
                 run.run();
                 return null;
-            });
+            }, false);
         } else {
             Thread.startVirtualThread(run);
         }
@@ -238,12 +332,12 @@ public class VertxAsyncContext implements AsyncContext {
 
     @Override
     public void addListener(AsyncListener listener) {
-        listeners.add(listener);
+        listeners.add(new Registration(listener, request, response));
     }
 
     @Override
     public void addListener(AsyncListener listener, ServletRequest req, ServletResponse resp) {
-        listeners.add(listener);
+        listeners.add(new Registration(listener, req, resp));
     }
 
     @Override
@@ -258,6 +352,9 @@ public class VertxAsyncContext implements AsyncContext {
     @Override
     public void setTimeout(long timeout) {
         this.timeout = timeout;
+        if (!completed.get() && !dispatchRequested.get()) {
+            startTimeout();
+        }
     }
 
     @Override
@@ -265,53 +362,91 @@ public class VertxAsyncContext implements AsyncContext {
         return timeout;
     }
 
-    private void onTimeout() {
-        AsyncEvent event = new AsyncEvent(this, request, response);
-        for (AsyncListener listener : listeners) {
+    /**
+     * Fires the listeners for a re-started async cycle. The spec re-registers listeners on
+     * {@code startAsync}, so this is invoked by the request when async starts again.
+     */
+    void notifyStartAsync(AsyncContext newContext) {
+        for (Registration reg : listeners) {
             try {
-                listener.onTimeout(event);
+                reg.listener().onStartAsync(reg.event(newContext, null));
+            } catch (Exception e) {
+                log.warn("Error in AsyncListener.onStartAsync", e);
+            }
+        }
+    }
+
+    private void onTimeoutFired() {
+        timerId = null;
+        if (completed.get() || dispatchRequested.get()) {
+            return;
+        }
+        Callbacks cb = callbacks;
+        if (cb != null) {
+            cb.execute(this::runTimeout);
+        } else {
+            runTimeout();
+        }
+    }
+
+    private void runTimeout() {
+        if (completed.get() || dispatchRequested.get()) {
+            return;
+        }
+        for (Registration reg : listeners) {
+            try {
+                reg.listener().onTimeout(reg.event(this, null));
             } catch (Exception e) {
                 log.warn("Error in AsyncListener.onTimeout", e);
             }
         }
-        if (!completed.get() && !dispatched.get()) {
-            if (response instanceof VertxServletResponse vsr) {
-                try {
-                    if (!vsr.isCommitted()) {
-                        vsr.sendError(500, "Async operation timed out");
-                    }
-                } catch (Exception e) {
-                    log.warn("Error sending timeout error", e);
-                }
-            }
-            complete();
+        // A listener may have completed or dispatched in response to the timeout.
+        if (completed.get() || dispatchRequested.get()) {
+            return;
         }
+        if (response instanceof VertxServletResponse vsr) {
+            try {
+                if (!vsr.isCommitted()) {
+                    vsr.sendError(500, "Async operation timed out");
+                }
+            } catch (Exception e) {
+                log.warn("Error sending timeout error", e);
+            }
+        }
+        // A timeout is raised by the container, not the application, so the response is finished
+        // straight away. Waiting for service() to return would defeat the point of the timeout -
+        // the servlet may well still be blocked, which is why it timed out.
+        completed.set(true);
+        cancelTimeout();
+        finishNow();
     }
 
-    private void onError(Throwable t) {
-        AsyncEvent event = new AsyncEvent(this, request, response, t);
-        for (AsyncListener listener : listeners) {
+    private void notifyError(Throwable t) {
+        for (Registration reg : listeners) {
             try {
-                listener.onError(event);
+                reg.listener().onError(reg.event(this, t));
             } catch (Exception e) {
                 log.warn("Error in AsyncListener.onError", e);
             }
         }
     }
 
-    private void closeResponse() {
-        if (response instanceof VertxServletResponse vsr) {
-            try {
-                vsr.close();
-            } catch (Exception e) {
-                log.warn("Error closing response", e);
-            }
+    /**
+     * Peels off any {@link jakarta.servlet.ServletRequestWrapper}s the application layered on, to
+     * reach the container's own request.
+     */
+    private static VertxServletRequest unwrap(ServletRequest request) {
+        ServletRequest current = request;
+        while (current instanceof jakarta.servlet.ServletRequestWrapper wrapper) {
+            current = wrapper.getRequest();
         }
+        return (current instanceof VertxServletRequest vsr) ? vsr : null;
     }
 
     private void cancelTimeout() {
-        if (timerId != null && vertx != null) {
-            vertx.cancelTimer(timerId);
+        Long id = timerId;
+        if (id != null && vertx != null) {
+            vertx.cancelTimer(id);
             timerId = null;
         }
     }

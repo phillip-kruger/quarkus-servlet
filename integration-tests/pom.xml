@@ -24,6 +24,17 @@
             <groupId>io.quarkiverse.servlet</groupId>
             <artifactId>quarkus-servlet</artifactId>
         </dependency>
+        <!-- Provides the web-fragment.xml that a library, not the application, declares. -->
+        <dependency>
+            <groupId>io.quarkiverse.servlet</groupId>
+            <artifactId>quarkus-servlet-test-fragment-lib</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <!-- Supplies the users that <login-config> and @ServletSecurity authenticate against. -->
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-elytron-security-properties-file</artifactId>
+        </dependency>
         <dependency>
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-junit</artifactId>

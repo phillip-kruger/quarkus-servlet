@@ -3,50 +3,62 @@ package io.quarkiverse.servlet.runtime;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 
 import jakarta.servlet.http.Part;
 
-import io.vertx.ext.web.FileUpload;
-
+/**
+ * A single part of a {@code multipart/form-data} request, backed by the bytes the container already
+ * buffered. Headers are the ones that actually appeared in the part, not a reconstruction.
+ */
 public class VertxPart implements Part {
 
     private final String name;
     private final String submittedFileName;
     private final String contentType;
-    private final long size;
-    private final Path filePath;
     private final byte[] content;
+    private final Map<String, List<String>> headers;
+    private final Charset charset;
 
-    VertxPart(FileUpload upload) {
-        this.name = upload.name();
-        this.submittedFileName = upload.fileName();
-        this.contentType = upload.contentType();
-        this.size = upload.size();
-        this.filePath = Path.of(upload.uploadedFileName());
-        this.content = null;
+    /** Directory that relative {@link #write(String)} names resolve against. */
+    private volatile Path location;
+
+    VertxPart(String name, String submittedFileName, String contentType, byte[] content,
+            Map<String, List<String>> headers, Charset charset) {
+        this.name = name;
+        this.submittedFileName = submittedFileName;
+        this.contentType = contentType;
+        this.content = content;
+        this.headers = headers;
+        this.charset = charset;
     }
 
-    VertxPart(String name, String value) {
-        this.name = name;
-        this.submittedFileName = null;
-        this.contentType = "text/plain";
-        this.content = value.getBytes(StandardCharsets.UTF_8);
-        this.size = this.content.length;
-        this.filePath = null;
+    void setLocation(Path location) {
+        this.location = location;
+    }
+
+    /** The raw bytes, used when a form field's value feeds {@code getParameter}. */
+    byte[] getContent() {
+        return content;
+    }
+
+    String getValueAsString() {
+        return new String(content, charset != null ? charset : StandardCharsets.UTF_8);
     }
 
     @Override
     public InputStream getInputStream() throws IOException {
-        if (filePath != null) {
-            return Files.newInputStream(filePath);
-        }
-        return new ByteArrayInputStream(content != null ? content : new byte[0]);
+        return new ByteArrayInputStream(content);
     }
 
     @Override
@@ -66,51 +78,51 @@ public class VertxPart implements Part {
 
     @Override
     public long getSize() {
-        return size;
+        return content.length;
     }
 
     @Override
     public void write(String fileName) throws IOException {
-        if (filePath != null) {
-            Files.copy(filePath, Path.of(fileName));
-        } else if (content != null) {
-            Files.write(Path.of(fileName), content);
+        Path target = Path.of(fileName);
+        if (!target.isAbsolute()) {
+            // Per the spec, relative names resolve against the @MultipartConfig location rather
+            // than the process working directory.
+            Path base = location;
+            target = (base != null) ? base.resolve(target) : target;
         }
+        Path parent = target.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        Files.write(target, content);
     }
 
     @Override
     public void delete() throws IOException {
-        if (filePath != null) {
-            Files.deleteIfExists(filePath);
-        }
+        // Parts live in memory; there is no temporary file to remove.
     }
 
     @Override
     public String getHeader(String name) {
-        if ("content-type".equalsIgnoreCase(name)) {
-            return contentType;
-        }
-        if ("content-disposition".equalsIgnoreCase(name)) {
-            StringBuilder sb = new StringBuilder("form-data; name=\"").append(this.name).append("\"");
-            if (submittedFileName != null) {
-                sb.append("; filename=\"").append(submittedFileName).append("\"");
-            }
-            return sb.toString();
-        }
-        return null;
+        List<String> values = headers.get(name.toLowerCase(Locale.ROOT));
+        return (values == null || values.isEmpty()) ? null : values.get(0);
     }
 
     @Override
     public Collection<String> getHeaders(String name) {
-        String value = getHeader(name);
-        return value != null ? List.of(value) : Collections.emptyList();
+        List<String> values = headers.get(name.toLowerCase(Locale.ROOT));
+        return values != null ? Collections.unmodifiableList(values) : Collections.emptyList();
     }
 
     @Override
     public Collection<String> getHeaderNames() {
-        if (submittedFileName != null) {
-            return List.of("content-type", "content-disposition");
+        return Collections.unmodifiableCollection(new ArrayList<>(headers.keySet()));
+    }
+
+    /** Copies to {@code target}, replacing anything already there. */
+    void copyTo(Path target) throws IOException {
+        try (InputStream in = getInputStream()) {
+            Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
         }
-        return List.of("content-disposition");
     }
 }

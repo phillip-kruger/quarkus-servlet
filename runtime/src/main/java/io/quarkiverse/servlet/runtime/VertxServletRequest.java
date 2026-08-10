@@ -7,6 +7,7 @@ import java.io.UnsupportedEncodingException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.charset.UnsupportedCharsetException;
+import java.nio.file.Path;
 import java.security.Principal;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
@@ -57,6 +58,8 @@ import io.vertx.ext.web.RoutingContext;
 
 public class VertxServletRequest implements HttpServletRequest {
 
+    private static final org.jboss.logging.Logger log = org.jboss.logging.Logger.getLogger(VertxServletRequest.class);
+
     private static final AtomicLong REQUEST_ID_COUNTER = new AtomicLong(0);
 
     private static final String[] HTTP_DATE_FORMATS = {
@@ -92,7 +95,8 @@ public class VertxServletRequest implements HttpServletRequest {
     private boolean sessionIdParsed;
     private VertxSessionStore sessionStore;
     private VertxAsyncContext asyncContext;
-    private boolean asyncStarted = false;
+    private VertxAsyncContext.Callbacks asyncCallbacks;
+    private volatile boolean asyncStarted = false;
     private boolean asyncSupported = false;
     private Vertx vertx;
     private ServletDeployment deployment;
@@ -100,6 +104,8 @@ public class VertxServletRequest implements HttpServletRequest {
     private String matchedPattern;
     private String servletName;
     private List<Part> multipartParts;
+    private MultipartConfiguration multipartLimits;
+    private ServletSecurityContext securityContext;
 
     public VertxServletRequest(RoutingContext routingContext, VertxServletContext servletContext,
             String servletPath, String pathInfo, String contextPath,
@@ -150,6 +156,9 @@ public class VertxServletRequest implements HttpServletRequest {
 
     @Override
     public String getAuthType() {
+        if (securityContext != null) {
+            return securityContext.authType();
+        }
         SecurityIdentity identity = getSecurityIdentity();
         if (identity != null && !identity.isAnonymous()) {
             String authType = identity.getAttribute("quarkus.http.auth.type");
@@ -264,29 +273,52 @@ public class VertxServletRequest implements HttpServletRequest {
 
     @Override
     public String getRemoteUser() {
-        SecurityIdentity identity = getSecurityIdentity();
-        if (identity != null && !identity.isAnonymous()) {
-            return identity.getPrincipal().getName();
-        }
-        return null;
+        Principal principal = getUserPrincipal();
+        return principal != null ? principal.getName() : null;
     }
 
     @Override
     public boolean isUserInRole(String role) {
+        if (role == null) {
+            return false;
+        }
+        // <security-role-ref> lets a servlet use its own name for a deployment role.
+        String resolved = role;
+        if (deployment != null && servletName != null) {
+            ServletInfo info = deployment.getServlets().get(servletName);
+            if (info != null) {
+                resolved = info.resolveRoleRef(role);
+            }
+        }
+        if (securityContext != null) {
+            return securityContext.hasRole(resolved);
+        }
         SecurityIdentity identity = getSecurityIdentity();
         if (identity != null) {
-            return identity.getRoles().contains(role);
+            return identity.getRoles().contains(resolved);
         }
         return false;
     }
 
     @Override
     public Principal getUserPrincipal() {
+        if (securityContext != null) {
+            return securityContext.principal();
+        }
         SecurityIdentity identity = getSecurityIdentity();
         if (identity != null && !identity.isAnonymous()) {
             return identity.getPrincipal();
         }
         return null;
+    }
+
+    /** The caller the container authenticated itself, or {@code null} when there is none. */
+    public ServletSecurityContext getServletSecurityContext() {
+        return securityContext;
+    }
+
+    public void setServletSecurityContext(ServletSecurityContext securityContext) {
+        this.securityContext = securityContext;
     }
 
     @Override
@@ -352,6 +384,24 @@ public class VertxServletRequest implements HttpServletRequest {
         this.deployment = deployment;
     }
 
+    /**
+     * Runs {@code action} on this request's own thread with its scopes active. Used to deliver
+     * WriteListener callbacks, which Vert.x raises on the event loop.
+     */
+    void runOnRequestThread(Runnable action) {
+        VertxAsyncContext.Callbacks callbacks = asyncCallbacks;
+        if (callbacks != null) {
+            callbacks.execute(action);
+        } else {
+            action.run();
+        }
+    }
+
+    /** Limits from the target servlet's {@code @MultipartConfig}, if it declared one. */
+    public void setMultipartLimits(MultipartConfiguration multipartLimits) {
+        this.multipartLimits = multipartLimits;
+    }
+
     public void setMapping(jakarta.servlet.http.MappingMatch mappingMatch, String matchedPattern,
             String servletName) {
         this.mappingMatch = mappingMatch;
@@ -386,9 +436,7 @@ public class VertxServletRequest implements HttpServletRequest {
                 return null;
             }
             session = sessionStore.createSession(servletContext);
-            routingContext.response().addCookie(
-                    io.vertx.core.http.Cookie.cookie("JSESSIONID", session.getId())
-                            .setPath(contextPath.isEmpty() ? "/" : contextPath));
+            routingContext.response().addCookie(newSessionCookie(session.getId()));
             return session;
         }
         if (!create) {
@@ -403,10 +451,11 @@ public class VertxServletRequest implements HttpServletRequest {
         if (cookieHeader == null) {
             return null;
         }
+        String prefix = sessionCookieName() + "=";
         for (String pair : cookieHeader.split(";")) {
             pair = pair.trim();
-            if (pair.startsWith("JSESSIONID=")) {
-                return pair.substring("JSESSIONID=".length()).trim();
+            if (pair.startsWith(prefix)) {
+                return pair.substring(prefix.length()).trim();
             }
         }
         return null;
@@ -435,10 +484,17 @@ public class VertxServletRequest implements HttpServletRequest {
                 idl.sessionIdChanged(event, oldId);
             }
         }
-        routingContext.response().addCookie(
-                io.vertx.core.http.Cookie.cookie("JSESSIONID", newId)
-                        .setPath(contextPath.isEmpty() ? "/" : contextPath));
+        routingContext.response().addCookie(newSessionCookie(newId));
         return newId;
+    }
+
+    private io.vertx.core.http.Cookie newSessionCookie(String id) {
+        return ServletSessions.newSessionCookie(servletContext, id, contextPath, request.isSSL());
+    }
+
+    /** The configured session cookie name, {@code JSESSIONID} unless the application changed it. */
+    private String sessionCookieName() {
+        return ServletSessions.cookieName(servletContext);
     }
 
     @Override
@@ -465,11 +521,26 @@ public class VertxServletRequest implements HttpServletRequest {
         return requestedSessionIdFromURL;
     }
 
+    /**
+     * {@code authenticate()} and {@code login()} are synchronous by signature, so they have to wait
+     * for the authentication result. That is safe on a worker or virtual thread, but on the event
+     * loop it would stall every connection that thread owns. Failing with a clear message beats
+     * deadlocking the server.
+     */
+    private static void assertCanBlock(String operation) throws ServletException {
+        if (io.vertx.core.Context.isOnEventLoopThread()) {
+            throw new ServletException(operation + "() blocks and cannot be called from a servlet "
+                    + "running on the event loop. Annotate the servlet with @Blocking or "
+                    + "@RunOnVirtualThread, or set quarkus.servlet.execution-model.");
+        }
+    }
+
     @Override
     public boolean authenticate(HttpServletResponse response) throws IOException, ServletException {
         if (getUserPrincipal() != null) {
             return true;
         }
+        assertCanBlock("authenticate");
         HttpAuthenticator authenticator = routingContext.get(HttpAuthenticator.class.getName());
         if (authenticator != null) {
             SecurityIdentity identity = authenticator.attemptAuthentication(routingContext)
@@ -488,6 +559,23 @@ public class VertxServletRequest implements HttpServletRequest {
         if (getUserPrincipal() != null) {
             throw new ServletException("User already logged in");
         }
+
+        // When the deployment declares its own identity store the container authenticates
+        // directly, which also keeps login() usable on the event loop.
+        if (deployment != null && deployment.getIdentityStore() != ServletIdentityStore.EMPTY) {
+            String authType = deployment.getLoginConfig() != null
+                    ? deployment.getLoginConfig().authMethod()
+                    : LoginConfig.BASIC;
+            ServletSecurityContext caller = deployment.getIdentityStore()
+                    .authenticate(username, password, authType);
+            if (caller == null) {
+                throw new ServletException("Login failed for user " + username);
+            }
+            ServletSecurityEnforcer.rememberLogin(this, caller);
+            return;
+        }
+
+        assertCanBlock("login");
         HttpAuthenticator authenticator = routingContext.get(HttpAuthenticator.class.getName());
         if (authenticator == null) {
             throw new ServletException("No authenticator available");
@@ -511,6 +599,10 @@ public class VertxServletRequest implements HttpServletRequest {
 
     @Override
     public void logout() throws ServletException {
+        if (securityContext != null) {
+            ServletSecurityEnforcer.logout(this);
+            return;
+        }
         SecurityIdentity identity = getSecurityIdentity();
         if (identity == null || identity.isAnonymous()) {
             return;
@@ -551,19 +643,48 @@ public class VertxServletRequest implements HttpServletRequest {
         if (ct == null || !ct.toLowerCase(Locale.ROOT).startsWith("multipart/")) {
             throw new ServletException("Request is not multipart");
         }
-        multipartParts = new ArrayList<>();
-        if (routingContext.fileUploads() != null) {
-            for (io.vertx.ext.web.FileUpload upload : routingContext.fileUploads()) {
-                multipartParts.add(new VertxPart(upload));
+        String boundary = MultipartParser.boundaryOf(ct);
+        if (boundary == null) {
+            throw new ServletException("Multipart request has no boundary parameter");
+        }
+
+        byte[] body = requestBody != null ? requestBody.getBytes() : new byte[0];
+        Charset headerCharset;
+        try {
+            String encoding = getCharacterEncoding();
+            headerCharset = encoding != null ? Charset.forName(encoding) : StandardCharsets.UTF_8;
+        } catch (RuntimeException e) {
+            headerCharset = StandardCharsets.UTF_8;
+        }
+
+        List<VertxPart> parsed = MultipartParser.parse(body, boundary, headerCharset, multipartLimits);
+        Path location = multipartLimits != null && multipartLimits.location() != null
+                && !multipartLimits.location().isEmpty()
+                        ? Path.of(multipartLimits.location())
+                        : null;
+        if (location != null) {
+            for (VertxPart part : parsed) {
+                part.setLocation(location);
             }
         }
-        if (routingContext.request().formAttributes() != null) {
-            for (var entry : routingContext.request().formAttributes()) {
-                boolean isFileField = multipartParts.stream()
-                        .anyMatch(p -> p.getName().equals(entry.getKey()) && p.getSubmittedFileName() != null);
-                if (!isFileField) {
-                    multipartParts.add(new VertxPart(entry.getKey(), entry.getValue()));
-                }
+        multipartParts = new ArrayList<>(parsed);
+    }
+
+    /**
+     * The form fields of a multipart request, which the spec folds into the request parameters
+     * alongside the query string.
+     */
+    private void addMultipartParameters(Map<String, List<String>> target) {
+        try {
+            ensureMultipartParsed();
+        } catch (ServletException | RuntimeException e) {
+            // A malformed body must not break getParameter for the query string.
+            return;
+        }
+        for (Part part : multipartParts) {
+            if (part.getSubmittedFileName() == null && part instanceof VertxPart vp) {
+                target.computeIfAbsent(part.getName(), k -> new ArrayList<>())
+                        .add(vp.getValueAsString());
             }
         }
     }
@@ -580,12 +701,25 @@ public class VertxServletRequest implements HttpServletRequest {
                 handler = handlerClass.getDeclaredConstructor().newInstance();
             }
             routingContext.response().setStatusCode(101);
-            io.vertx.core.net.NetSocket socket = routingContext.request().toNetSocket().await();
-            VertxWebConnection connection = new VertxWebConnection(socket);
-            handler.init(connection);
+
+            // toNetSocket() must not be awaited here: on the default execution model this runs on
+            // the event loop, and awaiting would deadlock the very thread that has to complete the
+            // handshake. The handler is initialised from the completion callback instead, which is
+            // also what the spec describes - the upgrade takes effect once service() returns.
+            final T upgradeHandler = handler;
+            routingContext.request().toNetSocket().onComplete(ar -> {
+                if (ar.failed()) {
+                    log.error("HTTP upgrade failed", ar.cause());
+                    return;
+                }
+                try {
+                    upgradeHandler.init(new VertxWebConnection(ar.result()));
+                } catch (Exception e) {
+                    log.error("HTTP upgrade handler failed to initialise", e);
+                    ar.result().close();
+                }
+            });
             return handler;
-        } catch (IOException e) {
-            throw e;
         } catch (Exception e) {
             throw new ServletException("Failed to upgrade connection", e);
         }
@@ -721,7 +855,7 @@ public class VertxServletRequest implements HttpServletRequest {
         }
         inputStreamCalled = true;
         if (servletInputStream == null) {
-            servletInputStream = new VertxServletInputStream(requestBody);
+            servletInputStream = newInputStream();
         }
         return servletInputStream;
     }
@@ -938,11 +1072,27 @@ public class VertxServletRequest implements HttpServletRequest {
         if (asyncStarted) {
             throw new IllegalStateException("Async already started");
         }
+        VertxAsyncContext previous = asyncContext;
         asyncStarted = true;
-        boolean original = (servletRequest == this);
-        asyncContext = new VertxAsyncContext(servletRequest, servletResponse, original, vertx, deployment);
+        // True only when *both* the request and the response are the container's originals; a
+        // wrapper on either side means the application no longer has the original pair.
+        ServletResponse originalResponse = ServletRequestContext.get().getResponse();
+        boolean original = (servletRequest == this) && (servletResponse == originalResponse);
+        asyncContext = new VertxAsyncContext(servletRequest, servletResponse, this, original, vertx, deployment);
+        asyncContext.setCallbacks(asyncCallbacks);
+        if (previous != null) {
+            previous.notifyStartAsync(asyncContext);
+        }
         asyncContext.startTimeout();
         return asyncContext;
+    }
+
+    /**
+     * Attached by the container before the servlet runs, so that an {@link AsyncContext} created
+     * during {@code service()} can finish the exchange without racing the container.
+     */
+    public void setAsyncCallbacks(VertxAsyncContext.Callbacks asyncCallbacks) {
+        this.asyncCallbacks = asyncCallbacks;
     }
 
     @Override
@@ -1037,9 +1187,31 @@ public class VertxServletRequest implements HttpServletRequest {
      */
     private ServletInputStream getInternalInputStream() throws IOException {
         if (servletInputStream == null) {
-            servletInputStream = new VertxServletInputStream(requestBody);
+            servletInputStream = newInputStream();
         }
         return servletInputStream;
+    }
+
+    /**
+     * Creates the input stream, handing it the hook it needs to run ReadListener callbacks on this
+     * request's own thread with the request scope active.
+     */
+    private VertxServletInputStream newInputStream() {
+        VertxServletInputStream stream = new VertxServletInputStream(requestBody);
+        stream.setCallbackExecutor(action -> {
+            // The spec only allows a ReadListener in async or upgraded mode.
+            if (!asyncStarted) {
+                throw new IllegalStateException(
+                        "setReadListener() requires async processing to have been started");
+            }
+            VertxAsyncContext.Callbacks callbacks = asyncCallbacks;
+            if (callbacks != null) {
+                callbacks.execute(action);
+            } else {
+                action.run();
+            }
+        });
+        return stream;
     }
 
     private void ensureParametersParsed() {
@@ -1059,12 +1231,24 @@ public class VertxServletRequest implements HttpServletRequest {
             parseQueryString(originalQuery, merged);
         }
 
-        // Form parameters from POST body
+        // Form parameters from the request body, decoded with the request's character encoding
+        // (setCharacterEncoding or the Content-Type charset), not an assumed UTF-8.
         String contentType = getContentType();
         if (contentType != null
                 && contentType.toLowerCase(Locale.ROOT).startsWith("application/x-www-form-urlencoded")
                 && requestBody != null && requestBody.length() > 0) {
-            parseQueryString(requestBody.toString(StandardCharsets.UTF_8), merged);
+            Charset formCharset;
+            try {
+                String encoding = getCharacterEncoding();
+                formCharset = encoding != null ? Charset.forName(encoding) : StandardCharsets.UTF_8;
+            } catch (RuntimeException e) {
+                formCharset = StandardCharsets.UTF_8;
+            }
+            parseFormEncoded(requestBody.toString(formCharset), formCharset, merged);
+        } else if (contentType != null
+                && contentType.toLowerCase(Locale.ROOT).startsWith("multipart/form-data")
+                && requestBody != null && requestBody.length() > 0) {
+            addMultipartParameters(merged);
         }
 
         int maxParams = deployment != null ? deployment.getMaxParameters() : 1000;
@@ -1082,19 +1266,33 @@ public class VertxServletRequest implements HttpServletRequest {
     }
 
     private static void parseQueryString(String queryString, Map<String, List<String>> target) {
-        for (String param : queryString.split("&")) {
+        parseFormEncoded(queryString, StandardCharsets.UTF_8, target);
+    }
+
+    /**
+     * Parses {@code application/x-www-form-urlencoded} data. Parameters whose percent-encoding is
+     * malformed are skipped rather than failing the whole request: a single bad escape anywhere in
+     * the query string must not turn every parameter read into a 500.
+     */
+    private static void parseFormEncoded(String encoded, Charset charset,
+            Map<String, List<String>> target) {
+        for (String param : encoded.split("&")) {
             if (param.isEmpty()) {
                 continue;
             }
             int eq = param.indexOf('=');
             String name;
             String value;
-            if (eq >= 0) {
-                name = java.net.URLDecoder.decode(param.substring(0, eq), StandardCharsets.UTF_8);
-                value = java.net.URLDecoder.decode(param.substring(eq + 1), StandardCharsets.UTF_8);
-            } else {
-                name = java.net.URLDecoder.decode(param, StandardCharsets.UTF_8);
-                value = "";
+            try {
+                if (eq >= 0) {
+                    name = java.net.URLDecoder.decode(param.substring(0, eq), charset);
+                    value = java.net.URLDecoder.decode(param.substring(eq + 1), charset);
+                } else {
+                    name = java.net.URLDecoder.decode(param, charset);
+                    value = "";
+                }
+            } catch (IllegalArgumentException e) {
+                continue;
             }
             target.computeIfAbsent(name, k -> new ArrayList<>()).add(value);
         }

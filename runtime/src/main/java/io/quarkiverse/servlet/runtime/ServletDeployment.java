@@ -27,11 +27,14 @@ public class ServletDeployment {
     private final Map<Integer, String> errorPages = new LinkedHashMap<>();
     private final Map<String, String> exceptionErrorPages = new LinkedHashMap<>();
     private final List<FilterInfo> filters = new ArrayList<>();
+    private final List<ServletContainerInitializerInfo> containerInitializers = new ArrayList<>();
     private final VertxSessionStore sessionStore = new VertxSessionStore();
     private List<String> welcomeFiles = List.of();
     private int maxParameters = 1000;
-    private boolean defaultVirtualThreads;
+    private ExecutionModel defaultExecutionModel = ExecutionModel.EVENT_LOOP;
     private List<ServletSecurityConstraint> securityConstraints = List.of();
+    private LoginConfig loginConfig;
+    private ServletIdentityStore identityStore = ServletIdentityStore.EMPTY;
 
     private ManagedContext cachedRequestContext;
     private CurrentVertxRequest cachedCurrentVertxRequest;
@@ -39,6 +42,11 @@ public class ServletDeployment {
 
     public ServletDeployment(VertxServletContext servletContext) {
         this.servletContext = servletContext;
+        // The context needs to reach back into the deployment to resolve request dispatchers.
+        // Wiring it here rather than at each call site means a caller cannot forget: without it
+        // every ServletContext.getRequestDispatcher() returns a dispatcher with nothing to
+        // dispatch to, and forwards fail at request time rather than at deployment time.
+        servletContext.setDeployment(this);
     }
 
     public int getMaxParameters() {
@@ -49,12 +57,12 @@ public class ServletDeployment {
         this.maxParameters = maxParameters;
     }
 
-    public boolean isDefaultVirtualThreads() {
-        return defaultVirtualThreads;
+    public ExecutionModel getDefaultExecutionModel() {
+        return defaultExecutionModel;
     }
 
-    public void setDefaultVirtualThreads(boolean defaultVirtualThreads) {
-        this.defaultVirtualThreads = defaultVirtualThreads;
+    public void setDefaultExecutionModel(ExecutionModel defaultExecutionModel) {
+        this.defaultExecutionModel = defaultExecutionModel;
     }
 
     public List<ServletSecurityConstraint> getSecurityConstraints() {
@@ -63,6 +71,23 @@ public class ServletDeployment {
 
     public void setSecurityConstraints(List<ServletSecurityConstraint> securityConstraints) {
         this.securityConstraints = securityConstraints;
+    }
+
+    /** The deployment's {@code <login-config>}, or {@code null} if it declared none. */
+    public LoginConfig getLoginConfig() {
+        return loginConfig;
+    }
+
+    public void setLoginConfig(LoginConfig loginConfig) {
+        this.loginConfig = loginConfig;
+    }
+
+    public ServletIdentityStore getIdentityStore() {
+        return identityStore;
+    }
+
+    public void setIdentityStore(ServletIdentityStore identityStore) {
+        this.identityStore = identityStore != null ? identityStore : ServletIdentityStore.EMPTY;
     }
 
     public void initCdiCache(ManagedContext requestContext, CurrentVertxRequest currentVertxRequest,
@@ -104,6 +129,12 @@ public class ServletDeployment {
         return urlPatternMatcher.match(path);
     }
 
+    /**
+     * Bounded because the cache is keyed by request path, which is attacker-controlled: an
+     * unbounded map would grow forever under a stream of distinct URLs.
+     */
+    private static final int FILTER_CACHE_MAX_ENTRIES = 4096;
+
     private final ConcurrentHashMap<FilterCacheKey, FilterInfo[]> filterCache = new ConcurrentHashMap<>();
 
     public FilterInfo[] getMatchingFilters(String path, DispatcherType dispatcherType) {
@@ -116,18 +147,40 @@ public class ServletDeployment {
             return EMPTY_FILTERS;
         }
         FilterCacheKey key = new FilterCacheKey(path, servletName, dispatcherType);
-        return filterCache.computeIfAbsent(key, k -> {
-            List<FilterInfo> matching = new ArrayList<>();
-            for (FilterInfo filter : filters) {
-                if (filter.matches(path, servletName, dispatcherType)) {
-                    matching.add(filter);
-                }
+        FilterInfo[] cached = filterCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        List<FilterInfo> matching = new ArrayList<>();
+        for (FilterInfo filter : filters) {
+            if (filter.matches(path, servletName, dispatcherType)) {
+                matching.add(filter);
             }
-            return matching.isEmpty() ? EMPTY_FILTERS : matching.toArray(new FilterInfo[0]);
-        });
+        }
+        FilterInfo[] result = matching.isEmpty() ? EMPTY_FILTERS : matching.toArray(new FilterInfo[0]);
+        if (filterCache.size() < FILTER_CACHE_MAX_ENTRIES) {
+            filterCache.putIfAbsent(key, result);
+        }
+        return result;
     }
 
     private record FilterCacheKey(String path, String servletName, DispatcherType dispatcherType) {
+    }
+
+    /**
+     * A request supports async only if the target servlet and every filter applied to it declare
+     * async support, as required by the servlet spec.
+     */
+    public static boolean isAsyncSupported(ServletInfo servlet, FilterInfo[] filters) {
+        if (!servlet.isAsyncSupported()) {
+            return false;
+        }
+        for (FilterInfo filter : filters) {
+            if (!filter.isAsyncSupported()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public void initServlets() {
@@ -146,9 +199,38 @@ public class ServletDeployment {
         }
     }
 
+    /**
+     * Creates the servlet instance if it does not have one yet.
+     * <p>
+     * Most servlets are instantiated in one pass when the deployment boots, but a servlet can also
+     * be registered after that - programmatically, or by name from a descriptor the container
+     * reaches later - and the first thing to touch it may well be a forward rather than that pass.
+     * Instantiating on demand means such a servlet works instead of failing with a null instance.
+     */
+    public void instantiateServlet(ServletInfo info) throws ServletException {
+        if (info.getServlet() != null) {
+            return;
+        }
+        try {
+            Class<?> clazz = Thread.currentThread().getContextClassLoader()
+                    .loadClass(info.getClassName());
+            Object instance = io.quarkus.arc.Arc.container().instance(clazz).get();
+            if (instance == null) {
+                instance = clazz.getDeclaredConstructor().newInstance();
+            }
+            info.setServlet((jakarta.servlet.Servlet) instance);
+        } catch (Exception | LinkageError e) {
+            // LinkageError as well as Exception: a servlet whose class is broken or whose
+            // dependencies are missing surfaces as NoClassDefFoundError, and letting that escape
+            // takes down the whole application instead of marking one servlet unavailable.
+            throw new ServletException("Failed to instantiate servlet: " + info.getClassName(), e);
+        }
+    }
+
     private void initServlet(ServletInfo info) throws ServletException {
         if (!info.isInitialized() && !info.isInitFailed()) {
             try {
+                instantiateServlet(info);
                 SimpleServletConfig config = new SimpleServletConfig(
                         info.getName(), servletContext, info.getInitParams());
                 info.getServlet().init(config);
@@ -204,6 +286,14 @@ public class ServletDeployment {
 
     public List<FilterInfo> getFilters() {
         return filters;
+    }
+
+    public void addContainerInitializer(ServletContainerInitializerInfo info) {
+        containerInitializers.add(info);
+    }
+
+    public List<ServletContainerInitializerInfo> getContainerInitializers() {
+        return containerInitializers;
     }
 
     public void addErrorPage(int statusCode, String location) {

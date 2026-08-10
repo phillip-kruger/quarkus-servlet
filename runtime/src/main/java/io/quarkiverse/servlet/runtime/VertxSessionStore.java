@@ -16,7 +16,61 @@ import jakarta.servlet.http.HttpSessionListener;
 
 public class VertxSessionStore {
 
+    /** How often idle sessions are swept out, in milliseconds. */
+    private static final long REAPER_INTERVAL_MS = 60_000;
+
     private final ConcurrentHashMap<String, SessionImpl> sessions = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicBoolean reaperStarted = new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile Long reaperTimerId;
+    private volatile io.vertx.core.Vertx vertx;
+
+    /**
+     * Starts the periodic sweep of timed-out sessions. Without it, sessions belonging to clients
+     * that never return would accumulate for the lifetime of the process and their
+     * {@code sessionDestroyed} events would never fire.
+     * <p>
+     * Idempotent, because it is called from the request path: the Vert.x instance is not available
+     * when the deployment boots.
+     */
+    public void startExpiryReaper(io.vertx.core.Vertx vertx) {
+        if (vertx == null || !reaperStarted.compareAndSet(false, true)) {
+            return;
+        }
+        this.vertx = vertx;
+        this.reaperTimerId = vertx.setPeriodic(REAPER_INTERVAL_MS, id -> reapExpiredSessions());
+    }
+
+    public void stopExpiryReaper() {
+        Long id = reaperTimerId;
+        if (id != null && vertx != null) {
+            vertx.cancelTimer(id);
+            reaperTimerId = null;
+        }
+    }
+
+    /**
+     * Removes every session whose idle timeout has elapsed, firing {@code sessionDestroyed} for
+     * each one just as an explicit {@code invalidate()} would.
+     */
+    void reapExpiredSessions() {
+        for (SessionImpl session : sessions.values()) {
+            if (!session.isValid()) {
+                expire(session);
+            }
+        }
+    }
+
+    private void expire(SessionImpl session) {
+        if (sessions.remove(session.getId(), session)) {
+            try {
+                session.expire();
+            } catch (RuntimeException e) {
+                // a misbehaving listener must not stop the sweep
+                java.util.logging.Logger.getLogger(VertxSessionStore.class.getName())
+                        .log(java.util.logging.Level.WARNING, "Error expiring session", e);
+            }
+        }
+    }
 
     public HttpSession getSession(String id) {
         if (id == null) {
@@ -28,7 +82,7 @@ public class VertxSessionStore {
             return session;
         }
         if (session != null) {
-            sessions.remove(id);
+            expire(session);
         }
         return null;
     }
@@ -88,6 +142,7 @@ public class VertxSessionStore {
         private volatile int maxInactiveInterval = 1800;
         private volatile boolean valid = true;
         private volatile boolean isNew = true;
+        private final java.util.concurrent.atomic.AtomicBoolean destroyed = new java.util.concurrent.atomic.AtomicBoolean();
 
         SessionImpl(String id, ServletContext servletContext) {
             this.id = id;
@@ -217,7 +272,40 @@ public class VertxSessionStore {
         @Override
         public void invalidate() {
             checkValid();
+            destroy();
+        }
+
+        /**
+         * Destroys a session that timed out rather than being explicitly invalidated. Listeners see
+         * exactly what they would for {@link #invalidate()}.
+         */
+        void expire() {
+            destroy();
+        }
+
+        /**
+         * Servlet 6.1, 11.3.3: {@code sessionDestroyed} is delivered <em>before</em> the session is
+         * invalidated, and attribute unbinding follows it. The order is not cosmetic - a listener
+         * is expected to read the session during {@code sessionDestroyed}, and the CDI session
+         * context does exactly that to find the beans it has to destroy. Invalidating first makes
+         * every one of those reads throw.
+         */
+        private void destroy() {
+            if (!destroyed.compareAndSet(false, true)) {
+                return;
+            }
+            if (servletContext instanceof VertxServletContext vsc) {
+                HttpSessionEvent event = new HttpSessionEvent(this);
+                var listeners = vsc.getListeners();
+                for (int i = listeners.size() - 1; i >= 0; i--) {
+                    if (listeners.get(i) instanceof HttpSessionListener hsl) {
+                        hsl.sessionDestroyed(event);
+                    }
+                }
+            }
+
             valid = false;
+
             // Unbind all attributes that implement HttpSessionBindingListener
             for (var entry : attributes.entrySet()) {
                 if (entry.getValue() instanceof HttpSessionBindingListener hsbl) {
@@ -236,16 +324,6 @@ public class VertxSessionStore {
                 }
             }
             attributes.clear();
-            // Notify HttpSessionListener.sessionDestroyed in reverse order (LIFO)
-            if (servletContext instanceof VertxServletContext vsc) {
-                HttpSessionEvent event = new HttpSessionEvent(this);
-                var listeners = vsc.getListeners();
-                for (int i = listeners.size() - 1; i >= 0; i--) {
-                    if (listeners.get(i) instanceof HttpSessionListener hsl) {
-                        hsl.sessionDestroyed(event);
-                    }
-                }
-            }
         }
 
         @Override

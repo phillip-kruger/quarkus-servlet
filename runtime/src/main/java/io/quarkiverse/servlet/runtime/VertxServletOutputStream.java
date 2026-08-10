@@ -1,6 +1,8 @@
 package io.quarkiverse.servlet.runtime;
 
 import java.io.IOException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.WriteListener;
@@ -18,6 +20,10 @@ public class VertxServletOutputStream extends ServletOutputStream {
     private boolean closed;
     private boolean committed;
     private boolean suspended;
+
+    private WriteListener writeListener;
+    private final AtomicBoolean listenerRunning = new AtomicBoolean();
+    private Consumer<Runnable> callbackExecutor;
 
     public VertxServletOutputStream(HttpServerResponse response) {
         this.response = response;
@@ -104,20 +110,51 @@ public class VertxServletOutputStream extends ServletOutputStream {
         if (writeListener == null) {
             throw new NullPointerException("WriteListener must not be null");
         }
-        response.drainHandler(v -> {
+        if (this.writeListener != null) {
+            throw new IllegalStateException("A WriteListener has already been set on this stream");
+        }
+        this.writeListener = writeListener;
+
+        // Vert.x signals drain on the event loop. Re-entering the listener from there while it is
+        // still running on the servlet thread would interleave writes, so delivery is serialised
+        // through notifyWritePossible().
+        response.drainHandler(v -> notifyWritePossible());
+
+        Runnable initial = this::notifyWritePossible;
+        if (callbackExecutor != null) {
+            callbackExecutor.accept(initial);
+        } else {
+            initial.run();
+        }
+    }
+
+    /**
+     * Delivers {@code onWritePossible} unless the listener is already running, in which case the
+     * spec's rule applies: the container calls back only after {@link #isReady()} has returned
+     * false, and the in-progress call will observe the new state itself.
+     */
+    private void notifyWritePossible() {
+        if (writeListener == null || !isReady()) {
+            return;
+        }
+        if (!listenerRunning.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            writeListener.onWritePossible();
+        } catch (Throwable t) {
             try {
-                writeListener.onWritePossible();
-            } catch (Throwable t) {
                 writeListener.onError(t);
+            } catch (Throwable ignored) {
+                // the listener is beyond help; the response will be closed by the container
             }
-        });
-        Thread.startVirtualThread(() -> {
-            try {
-                writeListener.onWritePossible();
-            } catch (Throwable t) {
-                writeListener.onError(t);
-            }
-        });
+        } finally {
+            listenerRunning.set(false);
+        }
+    }
+
+    void setCallbackExecutor(Consumer<Runnable> callbackExecutor) {
+        this.callbackExecutor = callbackExecutor;
     }
 
     int getBufferSize() {

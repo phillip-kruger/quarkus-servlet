@@ -1,22 +1,47 @@
 package io.quarkiverse.servlet.runtime;
 
+import java.util.function.Consumer;
+
 import jakarta.servlet.ReadListener;
 import jakarta.servlet.ServletInputStream;
 
 import io.vertx.core.buffer.Buffer;
 
+/**
+ * Servlet input stream over the request body, which the container has already buffered in full.
+ * <p>
+ * Because every byte is present before the servlet runs, {@link #isReady()} is true until the
+ * stream is exhausted and reads never block. The {@link ReadListener} contract is still honoured
+ * exactly: {@code onDataAvailable} is delivered while the listener keeps consuming, and
+ * {@code onAllDataRead} fires only once the application has actually read everything.
+ */
 public class VertxServletInputStream extends ServletInputStream {
 
     private final byte[] bodyBuffer;
     private int position;
     private boolean finished;
 
+    private ReadListener readListener;
+    private boolean allDataReadFired;
+
+    /**
+     * Runs listener callbacks on the request's own thread. Supplied by the container; when absent
+     * (a plain blocking read) the listener path is not used.
+     */
+    private Consumer<Runnable> callbackExecutor;
+
     public VertxServletInputStream(Buffer body) {
         if (body != null && body.length() > 0) {
             this.bodyBuffer = body.getBytes();
         } else {
             this.bodyBuffer = new byte[0];
+            // An empty body is complete from the outset.
+            this.finished = true;
         }
+    }
+
+    void setCallbackExecutor(Consumer<Runnable> callbackExecutor) {
+        this.callbackExecutor = callbackExecutor;
     }
 
     @Override
@@ -25,7 +50,11 @@ public class VertxServletInputStream extends ServletInputStream {
             finished = true;
             return -1;
         }
-        return bodyBuffer[position++] & 0xFF;
+        int value = bodyBuffer[position++] & 0xFF;
+        if (position >= bodyBuffer.length) {
+            finished = true;
+        }
+        return value;
     }
 
     @Override
@@ -56,6 +85,7 @@ public class VertxServletInputStream extends ServletInputStream {
 
     @Override
     public boolean isReady() {
+        // Data is already in memory, so reading can always proceed until the stream is exhausted.
         return !finished;
     }
 
@@ -64,15 +94,45 @@ public class VertxServletInputStream extends ServletInputStream {
         if (readListener == null) {
             throw new NullPointerException("ReadListener must not be null");
         }
-        Thread.startVirtualThread(() -> {
-            try {
-                if (bodyBuffer.length > 0 && !finished) {
-                    readListener.onDataAvailable();
+        if (this.readListener != null) {
+            throw new IllegalStateException("A ReadListener has already been set on this stream");
+        }
+        this.readListener = readListener;
+
+        Runnable pump = this::pump;
+        if (callbackExecutor != null) {
+            callbackExecutor.accept(pump);
+        } else {
+            pump.run();
+        }
+    }
+
+    /**
+     * Drives the listener. Keeps delivering {@code onDataAvailable} for as long as the listener
+     * makes progress, then reports completion. If a listener returns without consuming anything the
+     * loop stops rather than spinning - no more data can arrive to unblock it.
+     */
+    private void pump() {
+        try {
+            while (!finished) {
+                int before = position;
+                readListener.onDataAvailable();
+                if (position == before) {
+                    // The listener declined to consume; nothing further will change that.
+                    return;
                 }
-                readListener.onAllDataRead();
-            } catch (Throwable t) {
-                readListener.onError(t);
             }
-        });
+            fireAllDataRead();
+        } catch (Throwable t) {
+            readListener.onError(t);
+        }
+    }
+
+    private void fireAllDataRead() throws Exception {
+        if (allDataReadFired) {
+            return;
+        }
+        allDataReadFired = true;
+        readListener.onAllDataRead();
     }
 }

@@ -16,6 +16,10 @@
 
     <properties>
         <servlet.tck.version>6.1.2</servlet.tck.version>
+        <servlet.tck.timeout.seconds>3600</servlet.tck.timeout.seconds>
+        <!-- Booting a Quarkus application per deployment needs far more heap than driving the
+             runtime directly, so this is raised well above what the direct container needs. -->
+        <servlet.tck.heap>4g</servlet.tck.heap>
         <arquillian.version>1.10.2.Final</arquillian.version>
         <maven.deploy.skip>true</maven.deploy.skip>
         <gpg.skip>true</gpg.skip>
@@ -98,6 +102,23 @@
         </dependency>
 
         <!-- Deployment artifact for reactor ordering -->
+        <!-- Bootstrap/augmentation APIs, for the container that boots a real Quarkus app -->
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-core-deployment</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-bootstrap-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-bootstrap-maven-resolver</artifactId>
+            <scope>test</scope>
+        </dependency>
+
         <dependency>
             <groupId>io.quarkiverse.servlet</groupId>
             <artifactId>quarkus-servlet-deployment</artifactId>
@@ -119,57 +140,50 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-failsafe-plugin</artifactId>
                 <configuration>
-                    <argLine>-Xmx1g</argLine>
+                    <argLine>-Xmx${servlet.tck.heap}</argLine>
                     <dependenciesToScan>
                         <dependenciesToScan>jakarta.servlet.tck:servlet-tck-runtime</dependenciesToScan>
                     </dependenciesToScan>
                     <systemPropertyVariables>
+                        <!--
+                          These two are capability declarations, not test exclusions: every test
+                          still runs, but the TCK asserts the behaviour of a container that does
+                          not offer these optional features.
+
+                          crossContext - ServletContext.getContext(String) returns null here, which
+                          the spec explicitly permits ("if the container wishes to restrict
+                          access"). Quarkus deploys a single application, so there is no second
+                          context to hand out; quarkus-undertow behaves the same way.
+
+                          http2Push - server push is deprecated in Servlet 6.1 and unimplemented by
+                          current browsers.
+                        -->
                         <servlet.tck.support.crossContext>false</servlet.tck.support.crossContext>
                         <servlet.tck.support.http2Push>false</servlet.tck.support.http2Push>
                         <servlet.tck.archive.print>true</servlet.tck.archive.print>
+                        <!-- Which quarkus-servlet the Quarkus container resolves into the
+                             application model it builds for each deployment. -->
+                        <servlet.tck.extension.version>${project.version}</servlet.tck.extension.version>
+                        <servlet.tck.quarkus.version>${quarkus.version}</servlet.tck.quarkus.version>
                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
                     </systemPropertyVariables>
                     <includes>
                         <include>**/*Tests.java</include>
                     </includes>
-                    <excludes>
-                        <!-- Signature verification (not applicable) -->
-                        <exclude>**/SigTest.java</exclude>
-                        <exclude>**/SigTestServlet.java</exclude>
-                        <exclude>**/signature/**</exclude>
-                        <!-- Pluggability (needs web-fragment support) -->
-                        <exclude>**/pluggability/**/*</exclude>
-                        <exclude>servlet.tck.pluggability.**</exclude>
-                        <!-- Security (needs auth infrastructure) -->
-                        <exclude>**/ClientCertTests.java</exclude>
-                        <exclude>**/ClientCertAnnoTests.java</exclude>
-                        <exclude>**/security/**</exclude>
-                        <!-- Hangs: async context full tests -->
-                        <exclude>**/api/**/asynccontext/**</exclude>
-                        <exclude>**/spec/async/**</exclude>
-                        <!-- Hangs: HTTP upgrade, non-blocking I/O -->
-                        <exclude>**/httpupgradehandler/**</exclude>
-                        <exclude>**/readlistener*/**</exclude>
-                        <exclude>**/writelistener*/**</exclude>
-                        <!-- Hangs: HTTP/2 server push (deprecated) -->
-                        <exclude>**/serverpush/**</exclude>
-                        <!-- Hangs: httpservletrequest40 (async features) -->
-                        <exclude>**/httpservletrequest40/**</exclude>
-                        <!-- Hangs: httpservletresponse40 (trailer support) -->
-                        <exclude>**/httpservletresponse40/**</exclude>
-                        <!-- Hangs: httpservletrequest30/31 (session change) -->
-                        <exclude>**/httpservletrequest30/**</exclude>
-                        <exclude>**/httpservletrequest31/**</exclude>
-                        <!-- Hangs: sessioncookieconfig -->
-                        <exclude>**/sessioncookieconfig/**</exclude>
-                        <!-- Hangs: httpsessionx (cross-context sessions) -->
-                        <exclude>**/httpsessionx/**</exclude>
-                        <!-- Needs multipart support -->
-                        <exclude>**/part*/**</exclude>
-                    </excludes>
+                    <!--
+                      No exclusions: the full Jakarta Servlet 6.1 TCK runs. Anything that fails is
+                      a real gap in the implementation and must be fixed here, not filtered out.
+                    -->
                     <reuseForks>true</reuseForks>
                     <forkCount>1</forkCount>
                     <forkedProcessExitTimeoutInSeconds>300</forkedProcessExitTimeoutInSeconds>
+                    <!--
+                      A hard cap on the whole run. Unimplemented features (HTTP trailers, the
+                      non-blocking I/O listeners) currently hang their tests rather than failing
+                      them, and without this the build would sit there forever instead of
+                      reporting.
+                    -->
+                    <forkedProcessTimeoutInSeconds>${servlet.tck.timeout.seconds}</forkedProcessTimeoutInSeconds>
                 </configuration>
                 <executions>
                     <execution>

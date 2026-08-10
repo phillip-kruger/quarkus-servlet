@@ -10,6 +10,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.Collection;
 import java.util.Locale;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.http.Cookie;
@@ -27,6 +28,7 @@ public class VertxServletResponse implements HttpServletResponse {
     private boolean outputStreamUsed;
     private boolean writerUsed;
     private boolean errorSent;
+    private Supplier<Map<String, String>> trailerFieldsSupplier;
     private boolean redirectSent;
     private String characterEncoding;
     private boolean characterEncodingExplicitlySet;
@@ -240,6 +242,9 @@ public class VertxServletResponse implements HttpServletResponse {
         }
         if (outputStream == null) {
             outputStream = new VertxServletOutputStream(response);
+            if (request != null) {
+                outputStream.setCallbackExecutor(request::runOnRequestThread);
+            }
         }
         outputStreamUsed = true;
         return outputStream;
@@ -508,8 +513,52 @@ public class VertxServletResponse implements HttpServletResponse {
             outputStream.flush();
         }
         if (!response.ended()) {
+            applyTrailerFields();
             response.end();
         }
+    }
+
+    /**
+     * Copies the application's trailer fields onto the Vert.x response. Must run after the body has
+     * been flushed and before {@code end()}, which is when trailers are actually written.
+     */
+    private void applyTrailerFields() {
+        Supplier<Map<String, String>> supplier = trailerFieldsSupplier;
+        if (supplier == null) {
+            return;
+        }
+        Map<String, String> trailers;
+        try {
+            trailers = supplier.get();
+        } catch (RuntimeException e) {
+            // A broken supplier must not prevent the response from completing.
+            return;
+        }
+        if (trailers == null || trailers.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<String, String> entry : trailers.entrySet()) {
+            if (entry.getKey() != null && entry.getValue() != null) {
+                response.putTrailer(entry.getKey().toLowerCase(Locale.ROOT), entry.getValue());
+            }
+        }
+    }
+
+    @Override
+    public void setTrailerFields(Supplier<Map<String, String>> supplier) {
+        if (isCommitted()) {
+            throw new IllegalStateException("Cannot set trailer fields after the response is committed");
+        }
+        if (request != null && request.getProtocol() != null
+                && request.getProtocol().equals("HTTP/1.0")) {
+            throw new IllegalStateException("Trailer fields are not supported on HTTP/1.0");
+        }
+        this.trailerFieldsSupplier = supplier;
+    }
+
+    @Override
+    public Supplier<Map<String, String>> getTrailerFields() {
+        return trailerFieldsSupplier;
     }
 
     // ---- Internal helpers ----
@@ -535,11 +584,30 @@ public class VertxServletResponse implements HttpServletResponse {
     }
 
     private String buildErrorBody(int statusCode, String message) {
-        String title = (message != null) ? message : "Error " + statusCode;
+        // The message routinely carries request-derived text (the classic
+        // sendError(404, "Not found: " + getRequestURI()) idiom), so it must be escaped.
+        String safeMessage = (message != null) ? escapeHtml(message) : null;
+        String title = (safeMessage != null) ? safeMessage : "Error " + statusCode;
         return "<html><head><title>" + title + "</title></head>"
                 + "<body><h1>HTTP Error " + statusCode + "</h1>"
-                + (message != null ? "<p>" + message + "</p>" : "")
+                + (safeMessage != null ? "<p>" + safeMessage + "</p>" : "")
                 + "</body></html>";
+    }
+
+    private static String escapeHtml(String value) {
+        StringBuilder sb = new StringBuilder(value.length() + 16);
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            switch (c) {
+                case '&' -> sb.append("&amp;");
+                case '<' -> sb.append("&lt;");
+                case '>' -> sb.append("&gt;");
+                case '"' -> sb.append("&quot;");
+                case '\'' -> sb.append("&#39;");
+                default -> sb.append(c);
+            }
+        }
+        return sb.toString();
     }
 
     private String toAbsoluteUrl(String location) {

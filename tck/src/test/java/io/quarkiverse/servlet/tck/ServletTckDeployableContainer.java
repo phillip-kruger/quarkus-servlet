@@ -27,23 +27,32 @@ import org.jboss.arquillian.container.spi.client.container.LifecycleException;
 import org.jboss.arquillian.container.spi.client.protocol.ProtocolDescription;
 import org.jboss.arquillian.container.spi.client.protocol.metadata.HTTPContext;
 import org.jboss.arquillian.container.spi.client.protocol.metadata.ProtocolMetaData;
+import org.jboss.metadata.parser.servlet.WebFragmentMetaDataParser;
 import org.jboss.metadata.parser.servlet.WebMetaDataParser;
 import org.jboss.metadata.parser.util.MetaDataElementParser;
 import org.jboss.metadata.property.PropertyReplacers;
 import org.jboss.metadata.web.spec.FilterMappingMetaData;
 import org.jboss.metadata.web.spec.FilterMetaData;
 import org.jboss.metadata.web.spec.FiltersMetaData;
+import org.jboss.metadata.web.spec.LoginConfigMetaData;
+import org.jboss.metadata.web.spec.SecurityConstraintMetaData;
 import org.jboss.metadata.web.spec.ServletMappingMetaData;
 import org.jboss.metadata.web.spec.ServletMetaData;
+import org.jboss.metadata.web.spec.WebCommonMetaData;
+import org.jboss.metadata.web.spec.WebFragmentMetaData;
 import org.jboss.metadata.web.spec.WebMetaData;
+import org.jboss.metadata.web.spec.WebResourceCollectionMetaData;
 import org.jboss.shrinkwrap.api.Archive;
 import org.jboss.shrinkwrap.api.exporter.ExplodedExporter;
 import org.jboss.shrinkwrap.descriptor.api.Descriptor;
 
 import io.quarkiverse.servlet.runtime.FilterInfo;
+import io.quarkiverse.servlet.runtime.LoginConfig;
 import io.quarkiverse.servlet.runtime.ServletDeployment;
+import io.quarkiverse.servlet.runtime.ServletIdentityStore;
 import io.quarkiverse.servlet.runtime.ServletInfo;
 import io.quarkiverse.servlet.runtime.ServletRecorder;
+import io.quarkiverse.servlet.runtime.ServletSecurityConstraint;
 import io.quarkiverse.servlet.runtime.SimpleFilterConfig;
 import io.quarkiverse.servlet.runtime.SimpleServletConfig;
 import io.quarkiverse.servlet.runtime.VertxServletContext;
@@ -168,6 +177,9 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
             // Enable programmatic registration during initialization phase
             servletContext.setInitializing(true);
 
+            // Fragments first, so an explicit web.xml declaration of the same name wins.
+            registerWebFragments(deploymentDir, deployment, servletContext);
+
             if (Files.exists(webXml)) {
                 WebMetaData webMetaData2 = parseWebXml(webXml);
                 registerFromWebXml(webMetaData2, deployment, servletContext);
@@ -175,6 +187,7 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
                 parseSessionConfig(webMetaData2, servletContext);
                 parseLocaleEncodingMappings(webMetaData2, servletContext);
                 parseWelcomeFiles(webMetaData2, deployment, servletContext);
+                registerSecurity(webMetaData2, deployment);
                 if (webMetaData2.getVersion() != null) {
                     try {
                         String ver = webMetaData2.getVersion();
@@ -189,6 +202,9 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
             }
 
             // Scan for @WebServlet, @WebFilter, @WebListener annotations
+            // Constraints contributed by @ServletSecurity, merged with any from web.xml below.
+            List<ServletSecurityConstraint> annotationConstraints = new ArrayList<>();
+
             for (String className : classNames) {
                 try {
                     Class<?> clazz = Thread.currentThread().getContextClassLoader().loadClass(className);
@@ -210,6 +226,20 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
                                     List.of(urlPatterns), annInitParams, wsAnn.loadOnStartup(),
                                     wsAnn.asyncSupported());
                             info.setServlet(instance);
+
+                            jakarta.servlet.annotation.ServletSecurity securityAnn = clazz
+                                    .getAnnotation(jakarta.servlet.annotation.ServletSecurity.class);
+                            if (securityAnn != null) {
+                                annotationConstraints.addAll(
+                                        constraintsFromAnnotation(securityAnn, List.of(urlPatterns)));
+                            }
+                            jakarta.annotation.security.DeclareRoles declareRoles = clazz
+                                    .getAnnotation(jakarta.annotation.security.DeclareRoles.class);
+                            if (declareRoles != null) {
+                                for (String role : declareRoles.value()) {
+                                    servletContext.declareRoles(role);
+                                }
+                            }
                             SimpleServletConfig config = new SimpleServletConfig(name, servletContext, annInitParams);
                             try {
                                 instance.init(config);
@@ -248,7 +278,8 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
                             }
                         }
                         FilterInfo fInfo = new FilterInfo(name, className, List.of(urlPatterns),
-                                List.of(annServletNames), annDispTypes, annInitParams, 0);
+                                List.of(annServletNames), annDispTypes, annInitParams, 0,
+                                wfAnn.asyncSupported());
                         fInfo.setFilter(filterInstance);
                         SimpleFilterConfig fConfig = new SimpleFilterConfig(name, servletContext, annInitParams);
                         filterInstance.init(fConfig);
@@ -276,6 +307,17 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
 
             // Remember listener count before SCIs/TLDs add more
             int preScisListenerCount = servletContext.getListeners().size();
+
+            if (!annotationConstraints.isEmpty()) {
+                List<ServletSecurityConstraint> merged = new ArrayList<>(deployment.getSecurityConstraints());
+                merged.addAll(annotationConstraints);
+                deployment.setSecurityConstraints(merged);
+                if (deployment.getIdentityStore() == ServletIdentityStore.EMPTY) {
+                    deployment.setIdentityStore(tckIdentityStore());
+                }
+                System.out.println("[SERVLET-TCK]   @ServletSecurity constraints: "
+                        + annotationConstraints.size());
+            }
 
             // Scan for and invoke ServletContainerInitializers from WEB-INF/lib JARs
             scanAndInvokeScis(deploymentDir, servletContext);
@@ -402,7 +444,196 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
         }
     }
 
-    private void registerFromWebXml(WebMetaData webMetaData, ServletDeployment deployment,
+    /**
+     * Registers everything declared in {@code META-INF/web-fragment.xml} of the JARs (or exploded
+     * JAR directories) under {@code WEB-INF/lib}.
+     * <p>
+     * Web fragments are how the TCK's pluggability suites declare their servlets, so without this
+     * those deployments come up empty and every test in them fails.
+     */
+    private void registerWebFragments(Path deploymentDir, ServletDeployment deployment,
+            VertxServletContext servletContext) {
+        Path libDir = deploymentDir.resolve("WEB-INF/lib");
+        if (!Files.isDirectory(libDir)) {
+            return;
+        }
+        try (var entries = Files.list(libDir)) {
+            for (Path entry : entries.toList()) {
+                try {
+                    if (Files.isDirectory(entry)) {
+                        Path fragment = entry.resolve("META-INF/web-fragment.xml");
+                        if (Files.isRegularFile(fragment)) {
+                            try (InputStream is = Files.newInputStream(fragment)) {
+                                applyWebFragment(is, entry.getFileName().toString(), deployment,
+                                        servletContext);
+                            }
+                        }
+                    } else if (entry.getFileName().toString().endsWith(".jar")) {
+                        try (java.util.jar.JarFile jar = new java.util.jar.JarFile(entry.toFile())) {
+                            java.util.jar.JarEntry fragment = jar.getJarEntry("META-INF/web-fragment.xml");
+                            if (fragment != null) {
+                                try (InputStream is = jar.getInputStream(fragment)) {
+                                    applyWebFragment(is, entry.getFileName().toString(), deployment,
+                                            servletContext);
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    System.out.println("[SERVLET-TCK]   Failed to read web-fragment from "
+                            + entry.getFileName() + ": " + e.getMessage());
+                }
+            }
+        } catch (IOException e) {
+            System.out.println("[SERVLET-TCK]   Failed to list WEB-INF/lib: " + e.getMessage());
+        }
+    }
+
+    private void applyWebFragment(InputStream is, String source, ServletDeployment deployment,
+            VertxServletContext servletContext) throws Exception {
+        XMLInputFactory factory = XMLInputFactory.newInstance();
+        factory.setProperty(XMLInputFactory.IS_NAMESPACE_AWARE, true);
+        XMLStreamReader reader = factory.createXMLStreamReader(is);
+        WebFragmentMetaData fragment = WebFragmentMetaDataParser.parse(reader, PropertyReplacers.noop());
+        System.out.println("[SERVLET-TCK]   web-fragment.xml from " + source);
+        registerFromWebXml(fragment, deployment, servletContext);
+    }
+
+    /**
+     * The identity store the Jakarta TCK assumes: {@code j2ee} is the authorised user and
+     * {@code javajoe} the unauthorised one, mapped to roles by the TCK's own deployment
+     * descriptors. No principal holds the VP role, which several tests rely on.
+     */
+
+    /**
+     * {@code <async-supported>} defaults to false when the element is absent. jboss-metadata does
+     * not distinguish "absent" from "false" on the getter, so the explicit set-flag is consulted.
+     */
+    private static boolean asyncSupportedOf(ServletMetaData servlet) {
+        return servlet.getAsyncSupportedSet() && servlet.isAsyncSupported();
+    }
+
+    private static boolean asyncSupportedOf(FilterMetaData filter) {
+        return filter.getAsyncSupportedSet() && filter.isAsyncSupported();
+    }
+
+    private static ServletIdentityStore tckIdentityStore() {
+        return new ServletIdentityStore.InMemory()
+                .add("j2ee", "j2ee", java.util.Set.of("Administrator", "Employee"))
+                .add("javajoe", "javajoe", java.util.Set.of("Manager", "Employee"));
+    }
+
+    /** Transfers {@code <login-config>} and {@code <security-constraint>} to the deployment. */
+
+    /**
+     * Turns {@code @ServletSecurity} on a servlet class into security constraints over that
+     * servlet's own url-patterns, which is how the annotation is defined to behave.
+     * <p>
+     * {@code httpMethodConstraints} cover the methods they name; the class-level
+     * {@code @HttpConstraint} covers everything else, expressed as a method-omission constraint.
+     */
+    private static List<ServletSecurityConstraint> constraintsFromAnnotation(
+            jakarta.servlet.annotation.ServletSecurity annotation, List<String> urlPatterns) {
+
+        List<ServletSecurityConstraint> constraints = new ArrayList<>();
+        java.util.Set<String> namedMethods = new java.util.LinkedHashSet<>();
+
+        for (jakarta.servlet.annotation.HttpMethodConstraint methodConstraint : annotation.httpMethodConstraints()) {
+            namedMethods.add(methodConstraint.value());
+            constraints.add(new ServletSecurityConstraint(urlPatterns,
+                    java.util.Set.of(methodConstraint.value()), java.util.Set.of(),
+                    java.util.Set.of(methodConstraint.rolesAllowed()),
+                    toEmptyRoleSemantic(methodConstraint.emptyRoleSemantic()),
+                    toTransportGuarantee(methodConstraint.transportGuarantee())));
+        }
+
+        jakarta.servlet.annotation.HttpConstraint classConstraint = annotation.value();
+        constraints.add(new ServletSecurityConstraint(urlPatterns, java.util.Set.of(), namedMethods,
+                java.util.Set.of(classConstraint.rolesAllowed()),
+                toEmptyRoleSemantic(classConstraint.value()),
+                toTransportGuarantee(classConstraint.transportGuarantee())));
+        return constraints;
+    }
+
+    private static ServletSecurityConstraint.EmptyRoleSemantic toEmptyRoleSemantic(
+            jakarta.servlet.annotation.ServletSecurity.EmptyRoleSemantic semantic) {
+        return semantic == jakarta.servlet.annotation.ServletSecurity.EmptyRoleSemantic.DENY
+                ? ServletSecurityConstraint.EmptyRoleSemantic.DENY
+                : ServletSecurityConstraint.EmptyRoleSemantic.PERMIT;
+    }
+
+    private static ServletSecurityConstraint.TransportGuarantee toTransportGuarantee(
+            jakarta.servlet.annotation.ServletSecurity.TransportGuarantee guarantee) {
+        return guarantee == jakarta.servlet.annotation.ServletSecurity.TransportGuarantee.CONFIDENTIAL
+                ? ServletSecurityConstraint.TransportGuarantee.CONFIDENTIAL
+                : ServletSecurityConstraint.TransportGuarantee.NONE;
+    }
+
+    private void registerSecurity(WebCommonMetaData webMetaData, ServletDeployment deployment) {
+        LoginConfigMetaData loginConfig = (webMetaData instanceof WebMetaData wmd)
+                ? wmd.getLoginConfig()
+                : null;
+        if (loginConfig != null) {
+            String loginPage = null;
+            String errorPage = null;
+            if (loginConfig.getFormLoginConfig() != null) {
+                loginPage = loginConfig.getFormLoginConfig().getLoginPage();
+                errorPage = loginConfig.getFormLoginConfig().getErrorPage();
+            }
+            deployment.setLoginConfig(new LoginConfig(loginConfig.getAuthMethod(),
+                    loginConfig.getRealmName(), loginPage, errorPage));
+        }
+
+        List<ServletSecurityConstraint> constraints = new ArrayList<>();
+        if (webMetaData instanceof WebMetaData wmd && wmd.getSecurityConstraints() != null) {
+            for (SecurityConstraintMetaData sc : wmd.getSecurityConstraints()) {
+                if (sc.getResourceCollections() == null) {
+                    continue;
+                }
+                // An <auth-constraint> with no roles denies everyone; no element at all leaves the
+                // resource unchecked.
+                java.util.Set<String> roles = new java.util.LinkedHashSet<>();
+                boolean hasAuthConstraint = sc.getAuthConstraint() != null;
+                if (hasAuthConstraint && sc.getAuthConstraint().getRoleNames() != null) {
+                    roles.addAll(sc.getAuthConstraint().getRoleNames());
+                }
+                ServletSecurityConstraint.EmptyRoleSemantic emptyRole = hasAuthConstraint
+                        ? ServletSecurityConstraint.EmptyRoleSemantic.DENY
+                        : ServletSecurityConstraint.EmptyRoleSemantic.PERMIT;
+
+                ServletSecurityConstraint.TransportGuarantee transport = ServletSecurityConstraint.TransportGuarantee.NONE;
+                if (sc.getUserDataConstraint() != null
+                        && sc.getUserDataConstraint().getTransportGuarantee() != null
+                        && "CONFIDENTIAL".equalsIgnoreCase(
+                                sc.getUserDataConstraint().getTransportGuarantee().name())) {
+                    transport = ServletSecurityConstraint.TransportGuarantee.CONFIDENTIAL;
+                }
+
+                for (WebResourceCollectionMetaData collection : sc.getResourceCollections()) {
+                    List<String> patterns = collection.getUrlPatterns() != null
+                            ? new ArrayList<>(collection.getUrlPatterns())
+                            : List.of();
+                    java.util.Set<String> methods = collection.getHttpMethods() != null
+                            ? new java.util.LinkedHashSet<>(collection.getHttpMethods())
+                            : java.util.Set.of();
+                    java.util.Set<String> omissions = collection.getHttpMethodOmissions() != null
+                            ? new java.util.LinkedHashSet<>(collection.getHttpMethodOmissions())
+                            : java.util.Set.of();
+                    constraints.add(new ServletSecurityConstraint(patterns, methods, omissions,
+                            roles, emptyRole, transport));
+                }
+            }
+        }
+        if (!constraints.isEmpty()) {
+            deployment.setSecurityConstraints(constraints);
+            System.out.println("[SERVLET-TCK]   Security constraints: " + constraints.size());
+        }
+        if (deployment.getLoginConfig() != null || !constraints.isEmpty()) {
+            deployment.setIdentityStore(tckIdentityStore());
+        }
+    }
+
+    private void registerFromWebXml(WebCommonMetaData webMetaData, ServletDeployment deployment,
             VertxServletContext servletContext) throws Exception {
         Map<String, List<String>> servletMappings = new HashMap<>();
         if (webMetaData.getServletMappings() != null) {
@@ -431,8 +662,14 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
 
                 int loadOnStartup = servlet.getLoadOnStartupInt();
                 ServletInfo info = new ServletInfo(servlet.getServletName(), className,
-                        mappings, initParams, loadOnStartup, servlet.isAsyncSupported());
+                        mappings, initParams, loadOnStartup, asyncSupportedOf(servlet));
                 info.setServlet(instance);
+
+                // <security-role-ref> lets a servlet call isUserInRole() with its own role names.
+                if (servlet.getSecurityRoleRefs() != null) {
+                    servlet.getSecurityRoleRefs().forEach(
+                            ref -> info.addSecurityRoleRef(ref.getRoleName(), ref.getRoleLink()));
+                }
 
                 deployment.addServlet(info);
 
@@ -494,7 +731,8 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
                     java.util.Set<jakarta.servlet.DispatcherType> firstDispTypes = parseDispatchers(first);
 
                     info = new FilterInfo(filter.getFilterName(), className,
-                            firstPatterns, firstServletNames, firstDispTypes, initParams, 0);
+                            firstPatterns, firstServletNames, firstDispTypes, initParams, 0,
+                            asyncSupportedOf(filter));
 
                     // Add remaining mappings
                     for (int i = 1; i < mappings.size(); i++) {
@@ -509,7 +747,8 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
                     }
                 } else {
                     info = new FilterInfo(filter.getFilterName(), className,
-                            List.of("/*"), List.of(), null, initParams, 0);
+                            List.of("/*"), List.of(), null, initParams, 0,
+                            asyncSupportedOf(filter));
                 }
 
                 info.setFilter(instance);
@@ -560,7 +799,7 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
         return types;
     }
 
-    private void parseErrorPages(WebMetaData webMetaData, ServletDeployment deployment) {
+    private void parseErrorPages(WebCommonMetaData webMetaData, ServletDeployment deployment) {
         if (webMetaData.getErrorPages() != null) {
             for (var errorPage : webMetaData.getErrorPages()) {
                 if (errorPage.getErrorCode() != null) {
@@ -582,7 +821,7 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
         }
     }
 
-    private void parseSessionConfig(WebMetaData webMetaData, VertxServletContext servletContext) {
+    private void parseSessionConfig(WebCommonMetaData webMetaData, VertxServletContext servletContext) {
         if (webMetaData.getSessionConfig() != null) {
             var sessionConfig = webMetaData.getSessionConfig();
             if (sessionConfig.getSessionTimeoutSet()) {
@@ -630,7 +869,7 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
         };
     }
 
-    private void parseWelcomeFiles(WebMetaData webMetaData, ServletDeployment deployment,
+    private void parseWelcomeFiles(WebCommonMetaData webMetaData, ServletDeployment deployment,
             VertxServletContext servletContext) {
         if (webMetaData.getWelcomeFileList() != null
                 && webMetaData.getWelcomeFileList().getWelcomeFiles() != null) {
@@ -640,7 +879,7 @@ public class ServletTckDeployableContainer implements DeployableContainer<Servle
         }
     }
 
-    private void parseLocaleEncodingMappings(WebMetaData webMetaData, VertxServletContext servletContext) {
+    private void parseLocaleEncodingMappings(WebCommonMetaData webMetaData, VertxServletContext servletContext) {
         if (webMetaData.getLocalEncodings() != null
                 && webMetaData.getLocalEncodings().getMappings() != null) {
             Map<String, String> mappings = new HashMap<>();

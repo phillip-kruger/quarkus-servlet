@@ -13,7 +13,10 @@ public class ServletInfo {
     private final Map<String, String> initParams;
     private final int loadOnStartup;
     private final boolean asyncSupported;
-    private final boolean runOnVirtualThread;
+    private final ExecutionModel executionModel;
+    private final MultipartConfiguration multipartConfig;
+    /** {@code <security-role-ref>}: servlet-local role name to the deployment's role name. */
+    private final Map<String, String> securityRoleRefs = new java.util.HashMap<>();
     private Servlet servlet;
     private boolean initialized;
     private boolean initFailed;
@@ -22,19 +25,27 @@ public class ServletInfo {
 
     public ServletInfo(String name, String className, List<String> mappings,
             Map<String, String> initParams, int loadOnStartup, boolean asyncSupported) {
-        this(name, className, mappings, initParams, loadOnStartup, asyncSupported, false);
+        this(name, className, mappings, initParams, loadOnStartup, asyncSupported, null);
     }
 
     public ServletInfo(String name, String className, List<String> mappings,
             Map<String, String> initParams, int loadOnStartup, boolean asyncSupported,
-            boolean runOnVirtualThread) {
+            ExecutionModel executionModel) {
+        this(name, className, mappings, initParams, loadOnStartup, asyncSupported,
+                executionModel, null);
+    }
+
+    public ServletInfo(String name, String className, List<String> mappings,
+            Map<String, String> initParams, int loadOnStartup, boolean asyncSupported,
+            ExecutionModel executionModel, MultipartConfiguration multipartConfig) {
         this.name = name;
         this.className = className;
         this.mappings = mappings;
         this.initParams = initParams;
         this.loadOnStartup = loadOnStartup;
         this.asyncSupported = asyncSupported;
-        this.runOnVirtualThread = runOnVirtualThread;
+        this.executionModel = executionModel;
+        this.multipartConfig = multipartConfig;
     }
 
     public String getName() {
@@ -69,8 +80,35 @@ public class ServletInfo {
         return asyncSupported;
     }
 
-    public boolean isRunOnVirtualThread() {
-        return runOnVirtualThread;
+    public void addSecurityRoleRef(String roleName, String roleLink) {
+        if (roleName != null && roleLink != null) {
+            securityRoleRefs.put(roleName, roleLink);
+        }
+    }
+
+    /**
+     * Resolves a role name as used inside this servlet to the deployment role it links to, leaving
+     * unmapped names untouched.
+     */
+    public String resolveRoleRef(String roleName) {
+        return securityRoleRefs.getOrDefault(roleName, roleName);
+    }
+
+    /** The servlet's {@code @MultipartConfig}, or {@code null} if it declared none. */
+    public MultipartConfiguration getMultipartConfig() {
+        return multipartConfig;
+    }
+
+    /**
+     * The execution model declared on the servlet itself, or {@code null} when it declared none and
+     * the deployment-wide default applies.
+     */
+    public ExecutionModel getDeclaredExecutionModel() {
+        return executionModel;
+    }
+
+    public ExecutionModel getExecutionModel(ExecutionModel deploymentDefault) {
+        return executionModel != null ? executionModel : deploymentDefault;
     }
 
     public boolean isInitialized() {

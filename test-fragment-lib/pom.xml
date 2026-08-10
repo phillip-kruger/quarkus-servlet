@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.quarkiverse.servlet</groupId>
+        <artifactId>quarkus-servlet-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>quarkus-servlet-test-fragment-lib</artifactId>
+    <name>Quarkus Servlet - Test Fragment Library</name>
+    <description>
+        A library that declares a servlet and a listener in META-INF/web-fragment.xml, so the
+        integration tests cover fragments the way an application really meets them - in a jar on the
+        classpath. Declaring them in the application's own resources would not reproduce the bug
+        this exists to guard against, where fragments in libraries were never read at all.
+    </description>
+
+    <properties>
+        <maven.deploy.skip>true</maven.deploy.skip>
+        <gpg.skip>true</gpg.skip>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+        </dependency>
+    </dependencies>
+</project>
