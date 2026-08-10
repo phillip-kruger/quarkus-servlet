@@ -1,0 +1,15 @@
+Target: http://localhost:8080/plaintext
+Threads: 200  Duration: 15s
+
+Warming up... done
+  1s: 8,484 requests, 0 errors  2s: 82,083 requests, 0 errors  3s: 166,565 requests, 0 errors  4s: 249,610 requests, 0 errors  5s: 335,963 requests, 0 errors  6s: 421,796 requests, 0 errors  7s: 507,051 requests, 0 errors  8s: 593,054 requests, 0 errors  9s: 673,024 requests, 0 errors  10s: 759,384 requests, 0 errors  11s: 845,462 requests, 0 errors  12s: 931,892 requests, 0 errors  13s: 1,018,479 requests, 0 errors  14s: 1,104,745 requests, 0 errors  15s: 1,190,168 requests, 0 errors
+
+Results:
+  Requests/sec:   79,295.46
+  Total requests: 1,190,168
+  Errors:         0
+  Avg latency:    2.52 ms
+  p50 latency:    2.30 ms
+  p90 latency:    2.50 ms
+  p99 latency:    5.00 ms
+  Max latency:    85.95 ms

@@ -1,0 +1,15 @@
+Target: http://localhost:8080/cdi
+Threads: 50  Duration: 15s
+
+Warming up... done
+  1s: 17,329 requests, 0 errors  2s: 38,288 requests, 0 errors  3s: 70,068 requests, 0 errors  4s: 122,308 requests, 0 errors  5s: 176,835 requests, 0 errors  6s: 232,504 requests, 0 errors  7s: 287,594 requests, 0 errors  8s: 341,682 requests, 0 errors  9s: 396,089 requests, 0 errors  10s: 452,155 requests, 0 errors  11s: 504,896 requests, 0 errors  12s: 560,462 requests, 0 errors  13s: 616,204 requests, 0 errors  14s: 672,115 requests, 0 errors  15s: 727,673 requests, 0 errors
+
+Results:
+  Requests/sec:   48,479.10
+  Total requests: 727,673
+  Errors:         0
+  Avg latency:    1.03 ms
+  p50 latency:    0.80 ms
+  p90 latency:    1.50 ms
+  p99 latency:    3.50 ms
+  Max latency:    20.58 ms

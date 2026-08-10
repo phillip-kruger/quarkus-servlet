@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.quarkiverse</groupId>
+        <artifactId>quarkiverse-parent</artifactId>
+        <version>22</version>
+    </parent>
+
+    <groupId>io.quarkiverse.servlet</groupId>
+    <artifactId>quarkus-servlet-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>Quarkus Servlet - Parent</name>
+    <description>Jakarta Servlet 6.1 implementation on Vert.x 5 for Quarkus</description>
+
+    <modules>
+        <module>spi</module>
+        <module>runtime</module>
+        <module>runtime-dev</module>
+        <module>deployment</module>
+        <module>integration-tests</module>
+    </modules>
+
+    <properties>
+        <maven.compiler.release>21</maven.compiler.release>
+        <quarkus.version>999-SNAPSHOT</quarkus.version>
+        <jakarta.servlet-api.version>6.1.0</jakarta.servlet-api.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>io.quarkus</groupId>
+                <artifactId>quarkus-bom</artifactId>
+                <version>${quarkus.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>jakarta.servlet</groupId>
+                <artifactId>jakarta.servlet-api</artifactId>
+                <version>${jakarta.servlet-api.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.quarkiverse.servlet</groupId>
+                <artifactId>quarkus-servlet</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.quarkiverse.servlet</groupId>
+                <artifactId>quarkus-servlet-spi</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.quarkiverse.servlet</groupId>
+                <artifactId>quarkus-servlet-dev</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.quarkiverse.servlet</groupId>
+                <artifactId>quarkus-servlet-deployment</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <repositories>
+        <repository>
+            <id>sonatype-snapshots</id>
+            <url>https://s01.oss.sonatype.org/content/repositories/snapshots/</url>
+            <snapshots>
+                <enabled>true</enabled>
+            </snapshots>
+            <releases>
+                <enabled>false</enabled>
+            </releases>
+        </repository>
+    </repositories>
+    <pluginRepositories>
+        <pluginRepository>
+            <id>sonatype-snapshots</id>
+            <url>https://s01.oss.sonatype.org/content/repositories/snapshots/</url>
+            <snapshots>
+                <enabled>true</enabled>
+            </snapshots>
+            <releases>
+                <enabled>false</enabled>
+            </releases>
+        </pluginRepository>
+    </pluginRepositories>
+
+    <profiles>
+        <profile>
+            <id>tck</id>
+            <activation>
+                <property>
+                    <name>tck</name>
+                </property>
+            </activation>
+            <modules>
+                <module>tck</module>
+            </modules>
+        </profile>
+        <profile>
+            <id>perf</id>
+            <activation>
+                <property>
+                    <name>perf</name>
+                </property>
+            </activation>
+            <modules>
+                <module>perf-test</module>
+            </modules>
+        </profile>
+    </profiles>
+
+</project>

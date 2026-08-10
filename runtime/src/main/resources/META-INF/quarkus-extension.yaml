@@ -1,0 +1,14 @@
+---
+artifact: "${project.groupId}:${project.artifactId}:${project.version}"
+name: "Servlet"
+metadata:
+  short-name: "servlet"
+  keywords:
+    - "servlet"
+    - "http"
+    - "jakarta"
+  categories:
+    - "web"
+  status: "experimental"
+  config:
+    - "quarkus.servlet."

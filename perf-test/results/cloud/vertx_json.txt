@@ -1,0 +1,15 @@
+Target: http://localhost:8080/json
+Threads: 50  Duration: 15s
+
+Warming up... done
+  1s: 16,870 requests, 0 errors  2s: 37,405 requests, 0 errors  3s: 60,914 requests, 0 errors  4s: 94,736 requests, 0 errors  5s: 144,281 requests, 0 errors  6s: 200,862 requests, 0 errors  7s: 257,892 requests, 0 errors  8s: 314,573 requests, 0 errors  9s: 370,667 requests, 0 errors  10s: 427,086 requests, 0 errors  11s: 480,708 requests, 0 errors  12s: 536,303 requests, 0 errors  13s: 594,015 requests, 0 errors  14s: 651,328 requests, 0 errors  15s: 708,002 requests, 0 errors
+
+Results:
+  Requests/sec:   47,138.50
+  Total requests: 708,002
+  Errors:         0
+  Avg latency:    1.06 ms
+  p50 latency:    0.90 ms
+  p90 latency:    1.60 ms
+  p99 latency:    3.80 ms
+  Max latency:    20.63 ms
