@@ -17,6 +17,7 @@ public class ServletSecurityPolicy implements HttpSecurityPolicy {
 
     private volatile List<ServletSecurityConstraint> constraints = List.of();
     private volatile String contextPath = "/";
+    private volatile boolean denyUncoveredHttpMethods;
 
     public void setConstraints(List<ServletSecurityConstraint> constraints) {
         this.constraints = constraints;
@@ -24,6 +25,10 @@ public class ServletSecurityPolicy implements HttpSecurityPolicy {
 
     public void setContextPath(String contextPath) {
         this.contextPath = contextPath;
+    }
+
+    public void setDenyUncoveredHttpMethods(boolean denyUncoveredHttpMethods) {
+        this.denyUncoveredHttpMethods = denyUncoveredHttpMethods;
     }
 
     @Override
@@ -59,6 +64,12 @@ public class ServletSecurityPolicy implements HttpSecurityPolicy {
         }
 
         if (applicable.isEmpty()) {
+            // Servlet spec 13.8.4: when <deny-uncovered-http-methods/> is set, a request whose
+            // method is not covered by any constraint but whose url-pattern is otherwise
+            // constrained must be denied. A url-pattern with no constraint at all is unaffected.
+            if (denyUncoveredHttpMethods && isPathConstrained(path)) {
+                return Uni.createFrom().item(CheckResult.DENY);
+            }
             return Uni.createFrom().item(CheckResult.PERMIT);
         }
 
@@ -98,5 +109,19 @@ public class ServletSecurityPolicy implements HttpSecurityPolicy {
             }
             return CheckResult.DENY;
         });
+    }
+
+    /**
+     * True when some constraint's url-pattern matches this path, regardless of HTTP method. Such a
+     * path is "constrained", so an uncovered method on it is a gap to be denied rather than an
+     * unconstrained resource to be let through.
+     */
+    private boolean isPathConstrained(String path) {
+        for (ServletSecurityConstraint constraint : constraints) {
+            if (constraint.urlSpecificity(path) >= 0) {
+                return true;
+            }
+        }
+        return false;
     }
 }

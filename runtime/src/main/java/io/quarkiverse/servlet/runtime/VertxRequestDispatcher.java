@@ -106,6 +106,9 @@ public class VertxRequestDispatcher implements RequestDispatcher {
                         match.getServletPath(),
                         match.getPathInfo(),
                         targetQueryString);
+                // After a forward getHttpServletMapping() reflects the target servlet's mapping; the
+                // original mapping has already been captured in the FORWARD_MAPPING attribute above.
+                vsr.setMapping(match.getMappingMatch(), match.getMatchedPattern(), target.getName());
             }
         }
 
@@ -116,10 +119,12 @@ public class VertxRequestDispatcher implements RequestDispatcher {
 
         FilterInfo[] filters = deployment.getMatchingFilters(
                 targetPath, target.getName(), DispatcherType.FORWARD);
-        // Async support belongs to the chain actually handling the request, so it is recomputed
-        // for the forward target rather than inherited from the forwarding servlet.
+        // Async support is cumulative across a dispatch chain: once the request has passed through a
+        // filter or servlet that does not support async, it stays unsupported even if the forward
+        // target would support it on its own. So AND the target chain in rather than replacing.
         if (vsr != null) {
-            vsr.setAsyncSupported(ServletDeployment.isAsyncSupported(target, filters));
+            vsr.setAsyncSupported(vsr.isAsyncSupported()
+                    && ServletDeployment.isAsyncSupported(target, filters));
         }
         VertxFilterChain chain = new VertxFilterChain(filters, target);
         try {
@@ -198,16 +203,22 @@ public class VertxRequestDispatcher implements RequestDispatcher {
             throw new ServletException("Failed to initialize servlet for include", e);
         }
 
+        boolean originalAsyncSupported = vsr != null && vsr.isAsyncSupported();
         try {
             FilterInfo[] includeFilters = deployment.getMatchingFilters(
                     targetPath, target.getName(), DispatcherType.INCLUDE);
+            // Async support is cumulative: an include cannot grant async support the request did not
+            // already have, so AND the included chain in rather than replacing.
             if (vsr != null) {
-                vsr.setAsyncSupported(ServletDeployment.isAsyncSupported(target, includeFilters));
+                vsr.setAsyncSupported(originalAsyncSupported
+                        && ServletDeployment.isAsyncSupported(target, includeFilters));
             }
             VertxFilterChain includeChain = new VertxFilterChain(includeFilters, target);
             includeChain.doFilter(request, wrappedResponse);
         } finally {
             if (vsr != null) {
+                // The caller resumes after the include, so its async support is restored.
+                vsr.setAsyncSupported(originalAsyncSupported);
                 if (originalDispatchType != null) {
                     vsr.setDispatcherType(originalDispatchType);
                 }

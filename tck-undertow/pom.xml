@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.quarkiverse.servlet</groupId>
+        <artifactId>quarkus-servlet-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>quarkus-servlet-tck-undertow</artifactId>
+    <name>Quarkus Servlet - TCK (Undertow baseline)</name>
+    <description>
+        Runs the Jakarta Servlet 6.1 TCK against the Undertow servlet engine that quarkus-undertow
+        ships (quarkus-http-servlet), bridged to Vert.x exactly as the extension does. This is the
+        apples-to-apples baseline the quarkus-servlet implementation is measured against.
+    </description>
+
+    <properties>
+        <servlet.tck.version>6.1.2</servlet.tck.version>
+        <servlet.tck.timeout.seconds>3600</servlet.tck.timeout.seconds>
+        <servlet.tck.heap>2g</servlet.tck.heap>
+        <arquillian.version>1.10.2.Final</arquillian.version>
+        <!-- The Undertow servlet fork Quarkus main ships (rebased on the Servlet 6.1 API). -->
+        <quarkus-http.version>6.0.0.Alpha4</quarkus-http.version>
+        <!-- Present in the local repository; Quarkus main pins 5.1.6, unavailable offline. -->
+        <vertx.version>5.1.5</vertx.version>
+        <jboss-metadata-web.version>17.1.0</jboss-metadata-web.version>
+        <maven.deploy.skip>true</maven.deploy.skip>
+        <gpg.skip>true</gpg.skip>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.jboss.arquillian</groupId>
+                <artifactId>arquillian-bom</artifactId>
+                <version>${arquillian.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- The Servlet API the TCK is written against -->
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+        </dependency>
+
+        <!-- The Undertow servlet engine (as forked/shipped by quarkus-undertow) and its Vert.x bridge -->
+        <dependency>
+            <groupId>io.quarkus.http</groupId>
+            <artifactId>quarkus-http-servlet</artifactId>
+            <version>${quarkus-http.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus.http</groupId>
+            <artifactId>quarkus-http-core</artifactId>
+            <version>${quarkus-http.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus.http</groupId>
+            <artifactId>quarkus-http-http-core</artifactId>
+            <version>${quarkus-http.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus.http</groupId>
+            <artifactId>quarkus-http-vertx-backend</artifactId>
+            <version>${quarkus-http.version}</version>
+        </dependency>
+
+        <!-- Vert.x: the HTTP server and the Router the bridge dispatches from -->
+        <dependency>
+            <groupId>io.vertx</groupId>
+            <artifactId>vertx-core</artifactId>
+            <version>${vertx.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.vertx</groupId>
+            <artifactId>vertx-web</artifactId>
+            <version>${vertx.version}</version>
+        </dependency>
+
+        <!-- web.xml / web-fragment.xml parsing -->
+        <dependency>
+            <groupId>org.jboss.metadata</groupId>
+            <artifactId>jboss-metadata-web</artifactId>
+            <version>${jboss-metadata-web.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.jboss.spec.javax.servlet</groupId>
+                    <artifactId>jboss-servlet-api_3.1_spec</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- The TCK tests themselves -->
+        <dependency>
+            <groupId>jakarta.servlet.tck</groupId>
+            <artifactId>servlet-tck-runtime</artifactId>
+            <version>${servlet.tck.version}</version>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>jakarta.servlet</groupId>
+                    <artifactId>jakarta.servlet-api</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- Arquillian JUnit 5 + out-of-container servlet protocol -->
+        <dependency>
+            <groupId>org.jboss.arquillian.junit5</groupId>
+            <artifactId>arquillian-junit5-container</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.jboss.arquillian.protocol</groupId>
+            <artifactId>arquillian-protocol-servlet-jakarta</artifactId>
+            <version>1.7.1.Final</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- JUnit 4 compat for TCK infrastructure -->
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13.2</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Logging for TCK WAR deployments -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>2.0.17</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <configuration>
+                    <argLine>-Xmx${servlet.tck.heap}</argLine>
+                    <dependenciesToScan>
+                        <dependenciesToScan>jakarta.servlet.tck:servlet-tck-runtime</dependenciesToScan>
+                    </dependenciesToScan>
+                    <systemPropertyVariables>
+                        <!-- Same optional-capability declarations as the quarkus-servlet TCK, so the
+                             two runs are compared on identical terms. -->
+                        <servlet.tck.support.crossContext>false</servlet.tck.support.crossContext>
+                        <servlet.tck.support.http2Push>false</servlet.tck.support.http2Push>
+                        <servlet.tck.archive.print>true</servlet.tck.archive.print>
+                    </systemPropertyVariables>
+                    <includes>
+                        <include>**/*Tests.java</include>
+                    </includes>
+                    <reuseForks>true</reuseForks>
+                    <forkCount>1</forkCount>
+                    <forkedProcessExitTimeoutInSeconds>300</forkedProcessExitTimeoutInSeconds>
+                    <forkedProcessTimeoutInSeconds>${servlet.tck.timeout.seconds}</forkedProcessTimeoutInSeconds>
+                    <!-- Undertow has unimplemented corners too; keep going and tally at the end. -->
+                    <testFailureIgnore>true</testFailureIgnore>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

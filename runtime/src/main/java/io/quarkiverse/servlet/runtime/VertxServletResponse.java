@@ -509,7 +509,10 @@ public class VertxServletResponse implements HttpServletResponse {
         if (writer != null) {
             writer.flush();
         }
-        if (outputStream != null) {
+        // A servlet may close its own stream (flushing and ending the response itself); re-flushing a
+        // closed stream would throw "Stream is closed" on the container's normal path. Its data is
+        // already out, so there is nothing left to flush.
+        if (outputStream != null && !outputStream.isClosed()) {
             outputStream.flush();
         }
         if (!response.ended()) {

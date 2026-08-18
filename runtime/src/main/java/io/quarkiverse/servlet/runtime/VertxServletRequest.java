@@ -106,6 +106,8 @@ public class VertxServletRequest implements HttpServletRequest {
     private List<Part> multipartParts;
     private MultipartConfiguration multipartLimits;
     private ServletSecurityContext securityContext;
+    /** Set by {@link #logout()} so the caller reads as anonymous for the rest of this request. */
+    private boolean loggedOut;
 
     public VertxServletRequest(RoutingContext routingContext, VertxServletContext servletContext,
             String servletPath, String pathInfo, String contextPath,
@@ -162,7 +164,14 @@ public class VertxServletRequest implements HttpServletRequest {
         SecurityIdentity identity = getSecurityIdentity();
         if (identity != null && !identity.isAnonymous()) {
             String authType = identity.getAttribute("quarkus.http.auth.type");
-            return authType;
+            if (authType != null) {
+                return authType;
+            }
+            // Quarkus does not always tag the identity with the mechanism, but a deployment has a
+            // single login-config, so its auth-method is what authenticated this caller.
+            if (deployment != null && deployment.getLoginConfig() != null) {
+                return deployment.getLoginConfig().authMethod();
+            }
         }
         return null;
     }
@@ -409,6 +418,21 @@ public class VertxServletRequest implements HttpServletRequest {
         this.servletName = servletName;
     }
 
+    /**
+     * After an async {@code dispatch(path)} the request paths and mapping reflect the dispatched
+     * target servlet (like a forward), while the originals live in the {@code jakarta.servlet.async.*}
+     * attributes. The request URI is left untouched so it still reports the URI the client sent.
+     */
+    public void setAsyncDispatchTarget(String servletPath, String pathInfo,
+            jakarta.servlet.http.MappingMatch mappingMatch, String matchedPattern, String servletName) {
+        this.servletPath = servletPath;
+        this.pathInfo = pathInfo;
+        this.mappingMatch = mappingMatch;
+        this.matchedPattern = matchedPattern;
+        this.servletName = servletName;
+        this.parameterMap = null;
+    }
+
     @Override
     public HttpSession getSession(boolean create) {
         if (session != null) {
@@ -604,6 +628,9 @@ public class VertxServletRequest implements HttpServletRequest {
             return;
         }
         SecurityIdentity identity = getSecurityIdentity();
+        // The caller must read as anonymous for the remainder of this request, whatever the source
+        // of the identity was.
+        loggedOut = true;
         if (identity == null || identity.isAnonymous()) {
             return;
         }
@@ -611,11 +638,19 @@ public class VertxServletRequest implements HttpServletRequest {
         if (session != null) {
             session.invalidate();
         }
+        // Drop the identity from the ambient CDI association, so nothing downstream re-derives the
+        // logged-out caller. The request itself reads as anonymous via the loggedOut flag.
         CurrentIdentityAssociation cia = io.quarkus.arc.Arc.container()
                 .instance(CurrentIdentityAssociation.class).get();
         if (cia != null) {
             cia.setIdentity((SecurityIdentity) null);
         }
+        // Expire the persistent credential cookie so later requests are not silently re-authenticated
+        // from it. Its path is the context root, matching how the FORM mechanism writes it.
+        io.vertx.core.http.Cookie expired = io.vertx.core.http.Cookie.cookie("quarkus-credential", "");
+        expired.setPath("/");
+        expired.setMaxAge(0);
+        routingContext.response().addCookie(expired);
     }
 
     @Override
@@ -743,12 +778,14 @@ public class VertxServletRequest implements HttpServletRequest {
                             ? pathInfo.substring(1)
                             : (pathInfo != null ? pathInfo : "");
                     case EXTENSION -> {
+                        // For an extension match (*.ext) the match value is the path minus the leading
+                        // slash and minus the extension: "/a.ts" against "*.ts" yields "a".
                         String sp = servletPath != null ? servletPath : "";
-                        int dot = sp.lastIndexOf('.');
                         if (sp.startsWith("/")) {
                             sp = sp.substring(1);
                         }
-                        yield dot > 0 ? sp.substring(0, dot - (servletPath.startsWith("/") ? 0 : 0)) : sp;
+                        int dot = sp.lastIndexOf('.');
+                        yield dot >= 0 ? sp.substring(0, dot) : sp;
                     }
                 };
             }
@@ -1170,6 +1207,9 @@ public class VertxServletRequest implements HttpServletRequest {
     // ---- Internal helper methods ----
 
     private SecurityIdentity getSecurityIdentity() {
+        if (loggedOut) {
+            return null;
+        }
         try {
             return QuarkusHttpUser.getSecurityIdentityBlocking(routingContext, null);
         } catch (Exception e) {
