@@ -33,6 +33,7 @@ public class ServletDeployment {
     private int maxParameters = 1000;
     private ExecutionModel defaultExecutionModel = ExecutionModel.EVENT_LOOP;
     private List<ServletSecurityConstraint> securityConstraints = List.of();
+    private boolean denyUncoveredHttpMethods;
     private LoginConfig loginConfig;
     private ServletIdentityStore identityStore = ServletIdentityStore.EMPTY;
 
@@ -71,6 +72,19 @@ public class ServletDeployment {
 
     public void setSecurityConstraints(List<ServletSecurityConstraint> securityConstraints) {
         this.securityConstraints = securityConstraints;
+    }
+
+    /**
+     * When {@code <deny-uncovered-http-methods/>} is declared, a request whose method is not
+     * covered by any constraint on an otherwise-constrained url-pattern is denied rather than
+     * allowed through.
+     */
+    public boolean isDenyUncoveredHttpMethods() {
+        return denyUncoveredHttpMethods;
+    }
+
+    public void setDenyUncoveredHttpMethods(boolean denyUncoveredHttpMethods) {
+        this.denyUncoveredHttpMethods = denyUncoveredHttpMethods;
     }
 
     /** The deployment's {@code <login-config>}, or {@code null} if it declared none. */
@@ -123,6 +137,20 @@ public class ServletDeployment {
     public void addFilter(FilterInfo filterInfo) {
         filters.add(filterInfo);
         filters.sort(Comparator.comparingInt(FilterInfo::getPriority));
+    }
+
+    /**
+     * Returns the already-registered filter with the given name, or {@code null}. Used when a filter
+     * declares several {@code <filter-mapping>} entries: each mapping keeps its own dispatcher set and
+     * target, so they are merged onto one {@link FilterInfo} rather than producing duplicate filters.
+     */
+    public FilterInfo getFilter(String name) {
+        for (FilterInfo filter : filters) {
+            if (filter.getName().equals(name)) {
+                return filter;
+            }
+        }
+        return null;
     }
 
     public UrlPatternMatcher.MatchResult matchServlet(String path) {

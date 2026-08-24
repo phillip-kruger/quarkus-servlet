@@ -25,6 +25,7 @@ import org.jboss.metadata.web.spec.ErrorPageMetaData;
 import org.jboss.metadata.web.spec.FilterMappingMetaData;
 import org.jboss.metadata.web.spec.FilterMetaData;
 import org.jboss.metadata.web.spec.FiltersMetaData;
+import org.jboss.metadata.web.spec.LocaleEncodingMetaData;
 import org.jboss.metadata.web.spec.LoginConfigMetaData;
 import org.jboss.metadata.web.spec.ServletMappingMetaData;
 import org.jboss.metadata.web.spec.ServletMetaData;
@@ -183,17 +184,23 @@ public class ServletProcessor {
 
     @BuildStep
     void scanAnnotations(CombinedIndexBuildItem combinedIndex,
+            ExcludedFragmentClassesBuildItem excludedFragmentClasses,
             BuildProducer<ServletBuildItem> servletProducer,
             BuildProducer<FilterBuildItem> filterProducer,
             BuildProducer<ListenerBuildItem> listenerProducer) {
 
         IndexView index = combinedIndex.getIndex();
+        Set<String> excluded = excludedFragmentClasses.getClassNames();
 
         for (AnnotationInstance ann : index.getAnnotations(WEB_LISTENER)) {
             if (ann.target().kind() != AnnotationTarget.Kind.CLASS) {
                 continue;
             }
-            listenerProducer.produce(new ListenerBuildItem(ann.target().asClass().name().toString()));
+            String className = ann.target().asClass().name().toString();
+            if (excluded.contains(className)) {
+                continue;
+            }
+            listenerProducer.produce(new ListenerBuildItem(className));
         }
 
         for (AnnotationInstance ann : index.getAnnotations(WEB_SERVLET)) {
@@ -202,6 +209,9 @@ public class ServletProcessor {
             }
             ClassInfo clazz = ann.target().asClass();
             String className = clazz.name().toString();
+            if (excluded.contains(className)) {
+                continue;
+            }
 
             AnnotationValue nameValue = ann.value("name");
             String name = nameValue != null && !nameValue.asString().isEmpty()
@@ -233,6 +243,9 @@ public class ServletProcessor {
             }
             ClassInfo clazz = ann.target().asClass();
             String className = clazz.name().toString();
+            if (excluded.contains(className)) {
+                continue;
+            }
 
             AnnotationValue nameValue = ann.value("filterName");
             String name = nameValue != null && !nameValue.asString().isEmpty()
@@ -332,9 +345,12 @@ public class ServletProcessor {
                 int loadOnStartup = servlet.getLoadOnStartupInt();
                 boolean asyncSupported = servlet.isAsyncSupported();
 
+                // First value wins for a repeated param name: a duplicate <init-param> in web.xml,
+                // and (after fragment merging places web.xml's params first) any param a fragment
+                // tried to redefine. See WebXmlParsingBuildStep.mergeServlets.
                 Map<String, String> initParams = new HashMap<>();
                 if (servlet.getInitParam() != null) {
-                    servlet.getInitParam().forEach(p -> initParams.put(p.getParamName(), p.getParamValue()));
+                    servlet.getInitParam().forEach(p -> initParams.putIfAbsent(p.getParamName(), p.getParamValue()));
                 }
 
                 servletProducer.produce(new ServletBuildItem(
@@ -342,28 +358,16 @@ public class ServletProcessor {
             }
         }
 
-        Map<String, List<String>> filterUrlMappings = new HashMap<>();
-        Map<String, List<String>> filterServletNameMappings = new HashMap<>();
-        Map<String, java.util.Set<jakarta.servlet.DispatcherType>> filterDispatcherTypes = new HashMap<>();
+        // Each <filter-mapping> keeps its own dispatcher set and target (url-pattern or servlet-name):
+        // a filter mapped to a servlet only for FORWARD must not run on a plain REQUEST to that
+        // servlet. Merging every mapping of a filter into one combined tuple would lose that per-mapping
+        // association, so preserve the mappings individually and in document order.
+        Map<String, List<FilterMappingMetaData>> filterMappings = new HashMap<>();
         if (webMetaData.getFilterMappings() != null) {
             for (FilterMappingMetaData mapping : webMetaData.getFilterMappings()) {
-                if (mapping.getUrlPatterns() != null) {
-                    filterUrlMappings
-                            .computeIfAbsent(mapping.getFilterName(), k -> new ArrayList<>())
-                            .addAll(mapping.getUrlPatterns());
-                }
-                if (mapping.getServletNames() != null) {
-                    filterServletNameMappings
-                            .computeIfAbsent(mapping.getFilterName(), k -> new ArrayList<>())
-                            .addAll(mapping.getServletNames());
-                }
-                if (mapping.getDispatchers() != null) {
-                    java.util.Set<jakarta.servlet.DispatcherType> types = filterDispatcherTypes
-                            .computeIfAbsent(mapping.getFilterName(), k -> new java.util.HashSet<>());
-                    for (var d : mapping.getDispatchers()) {
-                        types.add(jakarta.servlet.DispatcherType.valueOf(d.name()));
-                    }
-                }
+                filterMappings
+                        .computeIfAbsent(mapping.getFilterName(), k -> new ArrayList<>())
+                        .add(mapping);
             }
         }
 
@@ -375,19 +379,39 @@ public class ServletProcessor {
                 if (className == null) {
                     continue;
                 }
-                List<String> patterns = filterUrlMappings.getOrDefault(name, List.of("/*"));
-                List<String> servletNames = filterServletNameMappings.getOrDefault(name, List.of());
-                java.util.Set<jakarta.servlet.DispatcherType> dispTypes = filterDispatcherTypes.getOrDefault(name, null);
                 boolean asyncSupported = filter.isAsyncSupported();
 
                 Map<String, String> initParams = new HashMap<>();
                 if (filter.getInitParam() != null) {
-                    filter.getInitParam().forEach(p -> initParams.put(p.getParamName(), p.getParamValue()));
+                    filter.getInitParam().forEach(p -> initParams.putIfAbsent(p.getParamName(), p.getParamValue()));
                 }
 
-                filterProducer.produce(new FilterBuildItem(
-                        name, className, patterns, servletNames,
-                        dispTypes, asyncSupported, initParams, 0));
+                List<FilterMappingMetaData> mappings = filterMappings.getOrDefault(name, List.of());
+                if (mappings.isEmpty()) {
+                    // Declared but unmapped: still register it so named dispatch can find it.
+                    filterProducer.produce(new FilterBuildItem(
+                            name, className, List.of(), List.of(), null, asyncSupported, initParams, 0));
+                    continue;
+                }
+                // One FilterBuildItem per mapping; registerFilter merges them onto a single FilterInfo.
+                for (FilterMappingMetaData mapping : mappings) {
+                    List<String> patterns = mapping.getUrlPatterns() != null
+                            ? mapping.getUrlPatterns()
+                            : List.of();
+                    List<String> servletNames = mapping.getServletNames() != null
+                            ? mapping.getServletNames()
+                            : List.of();
+                    java.util.Set<jakarta.servlet.DispatcherType> dispTypes = null;
+                    if (mapping.getDispatchers() != null) {
+                        dispTypes = new java.util.HashSet<>();
+                        for (var d : mapping.getDispatchers()) {
+                            dispTypes.add(jakarta.servlet.DispatcherType.valueOf(d.name()));
+                        }
+                    }
+                    filterProducer.produce(new FilterBuildItem(
+                            name, className, patterns, servletNames,
+                            dispTypes, asyncSupported, initParams, 0));
+                }
             }
         }
     }
@@ -450,11 +474,21 @@ public class ServletProcessor {
             AnnotationValue classConstraint = annotation.value();
             AnnotationInstance httpConstraint = classConstraint == null ? null : classConstraint.asNested();
             // On @HttpConstraint the semantic *is* value().
-            constraints.add(new ServletSecurityConstraint(patterns,
-                    java.util.Set.of(), namedMethods,
-                    rolesOf(httpConstraint),
-                    emptyRoleSemanticOf(httpConstraint == null ? null : httpConstraint.value()),
-                    transportGuaranteeOf(httpConstraint)));
+            java.util.Set<String> classRoles = rolesOf(httpConstraint);
+            ServletSecurityConstraint.EmptyRoleSemantic classSemantic = emptyRoleSemanticOf(
+                    httpConstraint == null ? null : httpConstraint.value());
+            ServletSecurityConstraint.TransportGuarantee classTransport = transportGuaranteeOf(httpConstraint);
+            // An all-default @HttpConstraint (PERMIT, no roles, NONE) establishes no constraint on the
+            // methods it would otherwise cover, per the @HttpConstraint javadoc. Emitting it anyway
+            // would make those methods "covered", defeating <deny-uncovered-http-methods/>.
+            boolean classConstraintIsDefault = classRoles.isEmpty()
+                    && classSemantic == ServletSecurityConstraint.EmptyRoleSemantic.PERMIT
+                    && classTransport == ServletSecurityConstraint.TransportGuarantee.NONE;
+            if (!classConstraintIsDefault) {
+                constraints.add(new ServletSecurityConstraint(patterns,
+                        java.util.Set.of(), namedMethods,
+                        classRoles, classSemantic, classTransport));
+            }
         }
         return constraints;
     }
@@ -778,6 +812,11 @@ public class ServletProcessor {
                     ExecutionModel.EVENT_LOOP);
         }
 
+        // Role-ref aliases are declared per servlet in web.xml, so they can only be applied once
+        // the servlets themselves are registered.
+        webMetadataBuildItem.ifPresent(item -> applyServletRoleRefs(recorder, deployment,
+                item.getWebMetaData()));
+
         for (FilterBuildItem f : filters) {
             recorder.registerFilter(deployment, f.getName(), f.getFilterClass(),
                     f.getUrlPatterns(), f.getServletNames(), f.getDispatcherTypes(),
@@ -842,6 +881,28 @@ public class ServletProcessor {
      * to the runtime. Servlet and filter declarations are handled separately by
      * {@code processWebXml}, which turns them into build items.
      */
+    /**
+     * Applies each servlet's {@code <security-role-ref>} declarations so {@code isUserInRole} can
+     * translate the servlet's own role alias to the deployment role it links to.
+     */
+    private static void applyServletRoleRefs(ServletRecorder recorder,
+            RuntimeValue<ServletDeployment> deployment, WebMetaData webMetaData) {
+        if (webMetaData.getServlets() == null) {
+            return;
+        }
+        for (ServletMetaData servlet : webMetaData.getServlets()) {
+            if (servlet.getSecurityRoleRefs() == null) {
+                continue;
+            }
+            for (var ref : servlet.getSecurityRoleRefs()) {
+                if (ref.getRoleName() != null && ref.getRoleLink() != null) {
+                    recorder.addSecurityRoleRef(deployment, servlet.getServletName(),
+                            ref.getRoleName(), ref.getRoleLink());
+                }
+            }
+        }
+    }
+
     private static void applyWebXmlDeploymentMetadata(ServletRecorder recorder,
             RuntimeValue<ServletDeployment> deployment, WebMetaData webMetaData) {
 
@@ -885,6 +946,31 @@ public class ServletProcessor {
         SessionConfigMetaData sessionConfig = webMetaData.getSessionConfig();
         if (sessionConfig != null && sessionConfig.getSessionTimeout() > 0) {
             recorder.setSessionTimeout(deployment, sessionConfig.getSessionTimeout());
+        }
+
+        if (Boolean.TRUE.equals(webMetaData.getDenyUncoveredHttpMethods())) {
+            recorder.setDenyUncoveredHttpMethods(deployment, true);
+        }
+
+        // ServletContext.getServletContextName() returns the <display-name> from web.xml.
+        if (webMetaData.getDescriptionGroup() != null
+                && webMetaData.getDescriptionGroup().getDisplayName() != null
+                && !webMetaData.getDescriptionGroup().getDisplayName().isBlank()) {
+            recorder.setDisplayName(deployment, webMetaData.getDescriptionGroup().getDisplayName());
+        }
+
+        // <locale-encoding-mapping-list> drives the charset picked by ServletResponse.setLocale().
+        if (webMetaData.getLocalEncodings() != null
+                && webMetaData.getLocalEncodings().getMappings() != null) {
+            Map<String, String> localeEncodings = new HashMap<>();
+            for (LocaleEncodingMetaData mapping : webMetaData.getLocalEncodings().getMappings()) {
+                if (mapping.getLocale() != null && mapping.getEncoding() != null) {
+                    localeEncodings.put(mapping.getLocale(), mapping.getEncoding());
+                }
+            }
+            if (!localeEncodings.isEmpty()) {
+                recorder.setLocaleEncodingMappings(deployment, localeEncodings);
+            }
         }
     }
 

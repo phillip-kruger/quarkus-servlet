@@ -96,6 +96,17 @@
             </modules>
         </profile>
         <profile>
+            <id>tck-undertow</id>
+            <activation>
+                <property>
+                    <name>tck-undertow</name>
+                </property>
+            </activation>
+            <modules>
+                <module>tck-undertow</module>
+            </modules>
+        </profile>
+        <profile>
             <id>perf</id>
             <activation>
                 <property>

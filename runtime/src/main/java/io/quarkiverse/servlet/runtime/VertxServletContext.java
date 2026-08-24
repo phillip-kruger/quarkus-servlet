@@ -54,6 +54,7 @@ public class VertxServletContext implements ServletContext {
     private Map<String, String> mimeMappings = Map.of();
     private Map<String, String> localeEncodingMappings = Map.of();
     private Path deploymentDir;
+    private Path webInfMirror;
     private ServletDeployment deployment;
     private boolean initializing;
     private boolean restrictedContext;
@@ -67,6 +68,15 @@ public class VertxServletContext implements ServletContext {
     public VertxServletContext(String contextPath, Map<String, String> initParams) {
         this.contextPath = contextPath;
         this.initParams = new ConcurrentHashMap<>(initParams);
+        // The servlet spec requires a private scratch directory to be exposed under this attribute.
+        // A caller that lays out a real deployment (the direct TCK harness) overwrites it afterwards.
+        try {
+            Path tempDir = Files.createTempDirectory("quarkus-servlet-");
+            tempDir.toFile().deleteOnExit();
+            attributes.put(ServletContext.TEMPDIR, tempDir.toFile());
+        } catch (IOException e) {
+            log.warnf(e, "Could not create servlet temp directory");
+        }
     }
 
     public void setDisplayName(String displayName) {
@@ -213,6 +223,7 @@ public class VertxServletContext implements ServletContext {
             case "pdf" -> "application/pdf";
             case "zip" -> "application/zip";
             case "jar" -> "application/java-archive";
+            case "class" -> "application/x-java-class";
             case "woff" -> "font/woff";
             case "woff2" -> "font/woff2";
             default -> null;
@@ -221,27 +232,28 @@ public class VertxServletContext implements ServletContext {
 
     @Override
     public Set<String> getResourcePaths(String path) {
-        if (deploymentDir == null) {
+        if (path == null || !path.startsWith("/")) {
             return null;
         }
-        Path dir = deploymentDir.resolve(path.startsWith("/") ? path.substring(1) : path);
-        if (!Files.isDirectory(dir)) {
-            return null;
-        }
-        Set<String> result = new HashSet<>();
-        try (Stream<Path> entries = Files.list(dir)) {
-            entries.forEach(p -> {
-                String name = path.endsWith("/") ? path : path + "/";
-                name += p.getFileName().toString();
-                if (Files.isDirectory(p)) {
-                    name += "/";
+        String dirPath = path.endsWith("/") ? path : path + "/";
+        // An exploded deployment (the direct TCK harness) can be listed directly.
+        if (deploymentDir != null) {
+            Path dir = deploymentDir.resolve(dirPath.substring(1));
+            if (Files.isDirectory(dir)) {
+                Set<String> result = new HashSet<>();
+                try (Stream<Path> entries = Files.list(dir)) {
+                    entries.forEach(p -> result.add(
+                            dirPath + p.getFileName() + (Files.isDirectory(p) ? "/" : "")));
+                } catch (IOException e) {
+                    return null;
                 }
-                result.add(name);
-            });
-        } catch (IOException e) {
+                if (!result.isEmpty()) {
+                    return result;
+                }
+            }
             return null;
         }
-        return result.isEmpty() ? null : result;
+        return classpathResourcePaths(dirPath);
     }
 
     @Override
@@ -250,16 +262,42 @@ public class VertxServletContext implements ServletContext {
             throw new MalformedURLException("Path must start with '/' but was: " + path);
         }
         if (deploymentDir != null) {
-            Path resolved = deploymentDir.resolve(path.startsWith("/") ? path.substring(1) : path);
+            Path resolved = deploymentDir.resolve(path.substring(1));
             if (Files.exists(resolved)) {
                 return resolved.toUri().toURL();
             }
+            return null;
         }
-        URL url = Thread.currentThread().getContextClassLoader().getResource("META-INF/resources" + path);
-        if (url != null) {
-            return url;
+        String classpathResource = warPathToClasspath(path);
+        if (classpathResource == null) {
+            return null;
         }
-        return Thread.currentThread().getContextClassLoader().getResource(path.startsWith("/") ? path.substring(1) : path);
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        // Static content maps straight onto the classpath; the URL's own location does not matter.
+        if (!path.startsWith("/WEB-INF/")) {
+            return cl.getResource(classpathResource);
+        }
+        // A Quarkus deployment keeps WEB-INF resources elsewhere on the classpath (web.xml under
+        // META-INF, classes at the root), but getResource must hand back a URL that still reflects
+        // the WAR path. Mirror the resource into a temp tree that preserves that path.
+        if (cl.getResource(classpathResource) == null) {
+            return null;
+        }
+        try {
+            Path target = webInfMirror().resolve(path.substring(1));
+            if (!Files.exists(target)) {
+                Files.createDirectories(target.getParent());
+                try (InputStream in = cl.getResourceAsStream(classpathResource)) {
+                    if (in == null) {
+                        return null;
+                    }
+                    Files.copy(in, target);
+                }
+            }
+            return target.toUri().toURL();
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     @Override
@@ -273,14 +311,107 @@ public class VertxServletContext implements ServletContext {
                     return null;
                 }
             }
+            return null;
         }
-        InputStream is = Thread.currentThread().getContextClassLoader()
-                .getResourceAsStream("META-INF/resources" + path);
-        if (is != null) {
-            return is;
+        String classpathResource = warPathToClasspath(path);
+        if (classpathResource == null) {
+            return null;
         }
-        return Thread.currentThread().getContextClassLoader()
-                .getResourceAsStream(path.startsWith("/") ? path.substring(1) : path);
+        return Thread.currentThread().getContextClassLoader().getResourceAsStream(classpathResource);
+    }
+
+    /**
+     * Maps a servlet WAR resource path to the name the resource has on the Quarkus classpath, or
+     * {@code null} when the path cannot correspond to one. A Quarkus deployment flattens the WAR:
+     * {@code WEB-INF/web.xml} lands under {@code META-INF}, {@code WEB-INF/classes} at the classpath
+     * root and everything else as static content under {@code META-INF/resources}.
+     */
+    private static String warPathToClasspath(String path) {
+        String p = path.startsWith("/") ? path.substring(1) : path;
+        if (p.equals("WEB-INF/web.xml")) {
+            return "META-INF/web.xml";
+        }
+        if (p.startsWith("WEB-INF/classes/")) {
+            return p.substring("WEB-INF/classes/".length());
+        }
+        if (p.startsWith("WEB-INF/")) {
+            return null;
+        }
+        return "META-INF/resources/" + p;
+    }
+
+    /** Temp mirror preserving WAR paths, so getResource can return faithful WEB-INF URLs. */
+    private synchronized Path webInfMirror() throws IOException {
+        if (webInfMirror == null) {
+            webInfMirror = Files.createTempDirectory("quarkus-servlet-webinf-");
+            webInfMirror.toFile().deleteOnExit();
+        }
+        return webInfMirror;
+    }
+
+    /**
+     * Reconstructs the directory listing a WAR would present for the given path from the flat
+     * Quarkus classpath. Handles the synthetic {@code /WEB-INF/} directory (which no longer exists
+     * as such) and enumerates package and static-content directories via the classloader.
+     */
+    private Set<String> classpathResourcePaths(String dirPath) {
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        Set<String> result = new LinkedHashSet<>();
+        if (dirPath.equals("/WEB-INF/")) {
+            if (cl.getResource("META-INF/web.xml") != null) {
+                result.add("/WEB-INF/web.xml");
+            }
+            result.add("/WEB-INF/classes/");
+            return result;
+        }
+        String classpathResource = warPathToClasspath(dirPath);
+        if (classpathResource == null) {
+            return null;
+        }
+        for (String child : listClasspathChildren(cl, classpathResource)) {
+            result.add(dirPath + child);
+        }
+        return result.isEmpty() ? null : result;
+    }
+
+    /**
+     * Lists the immediate children of a classpath "directory", each suffixed with {@code /} when it
+     * is itself a directory. Works whether the classpath entry is an exploded directory or a jar.
+     */
+    private Set<String> listClasspathChildren(ClassLoader cl, String resourceDir) {
+        String dir = resourceDir.endsWith("/") ? resourceDir : resourceDir + "/";
+        Set<String> children = new LinkedHashSet<>();
+        try {
+            Enumeration<URL> urls = cl.getResources(dir);
+            while (urls.hasMoreElements()) {
+                URL url = urls.nextElement();
+                if ("file".equals(url.getProtocol())) {
+                    Path base = Path.of(url.toURI());
+                    if (Files.isDirectory(base)) {
+                        try (Stream<Path> entries = Files.list(base)) {
+                            entries.forEach(p -> children.add(
+                                    p.getFileName() + (Files.isDirectory(p) ? "/" : "")));
+                        }
+                    }
+                } else if ("jar".equals(url.getProtocol())) {
+                    java.net.JarURLConnection conn = (java.net.JarURLConnection) url.openConnection();
+                    try (java.util.jar.JarFile jar = conn.getJarFile()) {
+                        Enumeration<java.util.jar.JarEntry> jarEntries = jar.entries();
+                        while (jarEntries.hasMoreElements()) {
+                            String name = jarEntries.nextElement().getName();
+                            if (name.startsWith(dir) && name.length() > dir.length()) {
+                                String rest = name.substring(dir.length());
+                                int slash = rest.indexOf('/');
+                                children.add(slash < 0 ? rest : rest.substring(0, slash + 1));
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            return children;
+        }
+        return children;
     }
 
     @Override

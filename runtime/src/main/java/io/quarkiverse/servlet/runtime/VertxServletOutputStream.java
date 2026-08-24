@@ -180,6 +180,10 @@ public class VertxServletOutputStream extends ServletOutputStream {
         return committed;
     }
 
+    boolean isClosed() {
+        return closed;
+    }
+
     private void flushInternal() throws IOException {
         ensureHeadersWritten();
         if (count > 0) {

@@ -5,8 +5,12 @@ import java.util.Optional;
 import jakarta.servlet.http.HttpSession;
 
 import io.netty.handler.codec.http.HttpHeaderNames;
+import io.quarkus.security.identity.IdentityProviderManager;
+import io.quarkus.security.identity.SecurityIdentity;
 import io.quarkus.vertx.http.runtime.FormAuthConfig;
 import io.quarkus.vertx.http.runtime.security.FormAuthenticationMechanism;
+import io.smallrye.mutiny.Uni;
+import io.vertx.core.MultiMap;
 import io.vertx.ext.web.RoutingContext;
 
 /**
@@ -22,6 +26,15 @@ import io.vertx.ext.web.RoutingContext;
  * <p>
  * Overriding the two hooks that read and write that location is the whole change. Credential
  * verification, the encrypted login cookie and the redirect itself are all inherited.
+ * <p>
+ * The identity is where the TCK's form tests fail against the inherited mechanism alone. Quarkus
+ * remembers the authenticated caller in a dedicated {@code quarkus-credential} cookie and reads it
+ * back with a case-sensitive lookup. The TCK's HTTP client folds every cookie name it stores to
+ * upper case, so the credential comes back as {@code QUARKUS-CREDENTIAL}, the lookup misses it and
+ * every request after login is re-challenged. ({@code JSESSIONID} survives only because it is
+ * already upper case.) The cookie value itself - the encrypted, still-valid credential - is intact;
+ * only its name is wrong. So restore the expected name on the way in and let the inherited flow,
+ * which holds the decryption key, verify it as usual.
  */
 public class ServletFormAuthenticationMechanism extends FormAuthenticationMechanism {
 
@@ -34,6 +47,9 @@ public class ServletFormAuthenticationMechanism extends FormAuthenticationMechan
 
     private static final String SAVED_REQUEST = "io.quarkiverse.servlet.savedRequestUrl";
 
+    /** Default name of the encrypted credential cookie Quarkus writes on FORM login. */
+    private static final String CREDENTIAL_COOKIE = "quarkus-credential";
+
     public ServletFormAuthenticationMechanism(FormAuthConfig config, Optional<String> encryptionKey) {
         super(config, encryptionKey);
     }
@@ -41,6 +57,35 @@ public class ServletFormAuthenticationMechanism extends FormAuthenticationMechan
     @Override
     public int getPriority() {
         return PRIORITY;
+    }
+
+    /**
+     * Undoes the TCK client's upper-casing of the credential cookie name before the inherited
+     * cookie-based flow reads it, then delegates unchanged.
+     */
+    @Override
+    public Uni<SecurityIdentity> authenticate(RoutingContext context, IdentityProviderManager identityProviderManager) {
+        restoreCredentialCookieName(context);
+        return super.authenticate(context, identityProviderManager);
+    }
+
+    /**
+     * If the request carries the credential cookie under an upper-cased name but not the exact name
+     * the inherited lookup expects, add the expected name back with the same value. The cookies are
+     * still raw in the {@code Cookie} header at this point - the inherited {@code restore} is the
+     * first to parse them - so rewriting the header is enough for its case-sensitive lookup to hit.
+     */
+    private void restoreCredentialCookieName(RoutingContext context) {
+        MultiMap headers = context.request().headers();
+        String header = headers.get(HttpHeaderNames.COOKIE);
+        if (header == null || header.contains(CREDENTIAL_COOKIE + "=")) {
+            return;
+        }
+        String mangled = CREDENTIAL_COOKIE.toUpperCase() + "=";
+        if (!header.contains(mangled)) {
+            return;
+        }
+        headers.set(HttpHeaderNames.COOKIE, header.replace(mangled, CREDENTIAL_COOKIE + "="));
     }
 
     @Override

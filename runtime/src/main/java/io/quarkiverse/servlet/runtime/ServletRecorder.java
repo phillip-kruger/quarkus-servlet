@@ -79,6 +79,18 @@ public class ServletRecorder {
                 name, mappings, executionModel);
     }
 
+    /**
+     * Registers a {@code <security-role-ref>}: the alias a servlet uses in {@code isUserInRole}
+     * mapped to the deployment role it stands for. A no-op if the servlet is not present.
+     */
+    public void addSecurityRoleRef(RuntimeValue<ServletDeployment> deployment,
+            String servletName, String roleName, String roleLink) {
+        ServletInfo info = deployment.getValue().getServlets().get(servletName);
+        if (info != null) {
+            info.addSecurityRoleRef(roleName, roleLink);
+        }
+    }
+
     public void registerFilter(RuntimeValue<ServletDeployment> deployment,
             String name, String className, List<String> urlPatterns,
             List<String> servletNames, Set<DispatcherType> dispatcherTypes,
@@ -91,9 +103,17 @@ public class ServletRecorder {
             String name, String className, List<String> urlPatterns,
             List<String> servletNames, Set<DispatcherType> dispatcherTypes,
             Map<String, String> initParams, int priority, boolean asyncSupported) {
-        FilterInfo info = new FilterInfo(name, className, urlPatterns, servletNames,
-                dispatcherTypes, initParams, priority, asyncSupported);
-        deployment.getValue().addFilter(info);
+        // A filter may declare several <filter-mapping> entries, each with its own dispatcher set and
+        // target. They arrive as separate registrations but must share one FilterInfo so the filter
+        // runs once per request and each mapping keeps its own dispatcher/target association.
+        FilterInfo existing = deployment.getValue().getFilter(name);
+        if (existing != null) {
+            existing.addMapping(urlPatterns, servletNames, dispatcherTypes);
+        } else {
+            FilterInfo info = new FilterInfo(name, className, urlPatterns, servletNames,
+                    dispatcherTypes, initParams, priority, asyncSupported);
+            deployment.getValue().addFilter(info);
+        }
         log.debugf("Registered filter metadata: %s -> %s (servletNames=%s)", name, urlPatterns, servletNames);
     }
 
@@ -110,6 +130,7 @@ public class ServletRecorder {
             if (policy != null) {
                 policy.setConstraints(dep.getSecurityConstraints());
                 policy.setContextPath(dep.getServletContext().getContextPath());
+                policy.setDenyUncoveredHttpMethods(dep.isDenyUncoveredHttpMethods());
             }
         }
         // BASIC and FORM login are verified by the container, but the users are the application's.
@@ -186,6 +207,19 @@ public class ServletRecorder {
 
     public void setSessionTimeout(RuntimeValue<ServletDeployment> deployment, int minutes) {
         deployment.getValue().getServletContext().setDeploymentSessionTimeout(minutes);
+    }
+
+    public void setDisplayName(RuntimeValue<ServletDeployment> deployment, String displayName) {
+        deployment.getValue().getServletContext().setDisplayName(displayName);
+    }
+
+    public void setDenyUncoveredHttpMethods(RuntimeValue<ServletDeployment> deployment, boolean deny) {
+        deployment.getValue().setDenyUncoveredHttpMethods(deny);
+    }
+
+    public void setLocaleEncodingMappings(RuntimeValue<ServletDeployment> deployment,
+            Map<String, String> mappings) {
+        deployment.getValue().getServletContext().setLocaleEncodingMappings(mappings);
     }
 
     public Handler<RoutingContext> boot(RuntimeValue<ServletDeployment> deploymentValue,
@@ -465,9 +499,20 @@ public class ServletRecorder {
             }
             ExecutionModel deploymentDefault = deployment.getDefaultExecutionModel();
             UrlPatternMatcher.MatchResult match = deployment.matchServlet(relativePath);
-            return match != null
-                    ? match.getServletInfo().getExecutionModel(deploymentDefault)
-                    : deploymentDefault;
+            if (match == null) {
+                return deploymentDefault;
+            }
+            ServletInfo servlet = match.getServletInfo();
+            // An async-supported servlet may start async processing and then block its service()
+            // thread (e.g. waiting on the async timeout to fire). On the event loop that would
+            // stall the very timer it is waiting for, so such a servlet runs on a worker thread
+            // unless it explicitly asked for another model.
+            if (servlet.getDeclaredExecutionModel() == null
+                    && deploymentDefault == ExecutionModel.EVENT_LOOP
+                    && servlet.isAsyncSupported()) {
+                return ExecutionModel.WORKER;
+            }
+            return servlet.getExecutionModel(deploymentDefault);
         }
     }
 
@@ -567,27 +612,6 @@ public class ServletRecorder {
                 return;
             }
 
-            deployment.ensureServletInitialized(match.getServletInfo());
-
-            if (match.getServletInfo().isInitFailed()) {
-                int statusCode = match.getServletInfo().isPermanentlyUnavailable() ? 404 : 500;
-                if (!rc.response().headWritten()) {
-                    rc.response().setStatusCode(statusCode);
-                }
-                if (!rc.response().ended()) {
-                    String body;
-                    if (statusCode == 404) {
-                        body = "Servlet unavailable";
-                    } else {
-                        Exception initEx = match.getServletInfo().getInitException();
-                        body = "Status Code: 500\n" +
-                                "Exception: " + (initEx != null ? initEx.toString() : "Unknown") + "\n";
-                    }
-                    rc.response().end(body);
-                }
-                return;
-            }
-
             req = new VertxServletRequest(
                     rc, deployment.getServletContext(),
                     match.getServletPath(), match.getPathInfo(),
@@ -628,6 +652,38 @@ public class ServletRecorder {
                 }
             }
 
+            // Servlets initialise lazily on first access. Do it now that the request, response and
+            // request-scoped context all exist, so a ServletException from init() is routed to a
+            // matching <error-page> exactly like one thrown from service() - the outer catch below
+            // handles it once req is non-null.
+            try {
+                deployment.ensureServletInitialized(match.getServletInfo());
+            } catch (jakarta.servlet.UnavailableException ue) {
+                match.getServletInfo().setInitFailed(true);
+                if (!rc.response().headWritten()) {
+                    rc.response().setStatusCode(404);
+                }
+                if (!rc.response().ended()) {
+                    rc.response().end("Servlet unavailable");
+                }
+                return;
+            }
+            if (match.getServletInfo().isInitFailed()) {
+                // A failure cached from an earlier request: re-surface it so it takes the same route.
+                if (match.getServletInfo().isPermanentlyUnavailable()) {
+                    if (!rc.response().headWritten()) {
+                        rc.response().setStatusCode(404);
+                    }
+                    if (!rc.response().ended()) {
+                        rc.response().end("Servlet unavailable");
+                    }
+                    return;
+                }
+                Exception initEx = match.getServletInfo().getInitException();
+                throw initEx != null ? initEx
+                        : new ServletException("Servlet init failed: " + match.getServletInfo().getName());
+            }
+
             FilterInfo[] filters = deployment.getMatchingFilters(
                     relativePath, match.getServletInfo().getName(),
                     DispatcherType.REQUEST);
@@ -650,7 +706,18 @@ public class ServletRecorder {
                 // The servlet took ownership of the exchange. Leave the response open; the
                 // AsyncContext finishes it (and releases the request context) later.
                 asyncHandoff = true;
-                ((VertxAsyncContext) req.getAsyncContext()).onServiceReturned();
+                VertxAsyncContext asyncContext = (VertxAsyncContext) req.getAsyncContext();
+                // If the client goes away before the cycle completes - the normal end of a
+                // Server-Sent Events stream - Vert.x closes the response with nobody listening.
+                // addEndHandler reports that as a failed result (connection close or HTTP/2 reset),
+                // and we end the cycle so the application's AsyncListener is notified and request
+                // state is released, rather than the AsyncContext leaking until undeploy.
+                rc.addEndHandler(ar -> {
+                    if (ar.failed()) {
+                        asyncContext.onClientDisconnect();
+                    }
+                });
+                asyncContext.onServiceReturned();
                 return;
             }
 

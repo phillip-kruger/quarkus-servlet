@@ -38,6 +38,13 @@ public class DefaultServlet extends HttpServlet {
             }
         }
 
+        // WEB-INF and META-INF hold the deployment's own machinery; the spec forbids serving
+        // anything under them to a client, so a direct request is a plain not-found.
+        if (isProtectedPath(path)) {
+            resp.sendError(HttpServletResponse.SC_NOT_FOUND);
+            return;
+        }
+
         if (cachingEnabled) {
             CachedResource cached = cache.get(path);
             if (cached != null) {
@@ -61,6 +68,16 @@ public class DefaultServlet extends HttpServlet {
         }
 
         serveContent(resp, content, mimeType);
+    }
+
+    /** Whether any segment of the request path names the protected WEB-INF or META-INF directory. */
+    private static boolean isProtectedPath(String path) {
+        for (String segment : path.split("/")) {
+            if (segment.equalsIgnoreCase("WEB-INF") || segment.equalsIgnoreCase("META-INF")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void serveContent(HttpServletResponse resp, byte[] content, String mimeType)

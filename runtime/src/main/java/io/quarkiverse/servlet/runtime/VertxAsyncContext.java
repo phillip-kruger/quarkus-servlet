@@ -1,5 +1,6 @@
 package io.quarkiverse.servlet.runtime;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -234,6 +235,12 @@ public class VertxAsyncContext implements AsyncContext {
                 request.setAttribute(ASYNC_SERVLET_PATH, match.getServletPath());
                 request.setAttribute(ASYNC_PATH_INFO, match.getPathInfo());
                 request.setAttribute(ASYNC_QUERY_STRING, queryString);
+
+                // The dispatched servlet sees the target's paths and mapping (getHttpServletMapping,
+                // getServletPath, getPathInfo), mirroring a forward.
+                vsr.setAsyncDispatchTarget(match.getServletPath(), match.getPathInfo(),
+                        match.getMappingMatch(), match.getMatchedPattern(),
+                        match.getServletInfo().getName());
             }
 
             FilterInfo[] filters = deployment.getMatchingFilters(
@@ -400,22 +407,65 @@ public class VertxAsyncContext implements AsyncContext {
                 log.warn("Error in AsyncListener.onTimeout", e);
             }
         }
-        // A listener may have completed or dispatched in response to the timeout.
-        if (completed.get() || dispatchRequested.get()) {
+        // A listener may have dispatched in response to the timeout, in which case the dispatch
+        // owns the exchange from here and must not be finished out from under it.
+        if (dispatchRequested.get()) {
             return;
         }
-        if (response instanceof VertxServletResponse vsr) {
-            try {
-                if (!vsr.isCommitted()) {
-                    vsr.sendError(500, "Async operation timed out");
+        // If no listener completed the exchange, the container completes it itself with an error.
+        if (!completed.get()) {
+            if (response instanceof VertxServletResponse vsr) {
+                try {
+                    if (!vsr.isCommitted()) {
+                        vsr.sendError(500, "Async operation timed out");
+                    }
+                } catch (Exception e) {
+                    log.warn("Error sending timeout error", e);
                 }
-            } catch (Exception e) {
-                log.warn("Error sending timeout error", e);
             }
+            completed.set(true);
         }
         // A timeout is raised by the container, not the application, so the response is finished
-        // straight away. Waiting for service() to return would defeat the point of the timeout -
-        // the servlet may well still be blocked, which is why it timed out.
+        // straight away - even when a listener called complete(). Waiting for service() to return
+        // would defeat the point of the timeout: the servlet may well still be blocked, which is
+        // why it timed out. finishNow() is idempotent, so the later service() return is harmless.
+        cancelTimeout();
+        finishNow();
+    }
+
+    /**
+     * Ends the async cycle because the client connection was closed before the application ever
+     * completed it - the normal way a Server-Sent Events stream stops. The registered listeners get
+     * {@code onError} followed by {@code onComplete}, and the request state is released, instead of
+     * the {@link AsyncContext} staying registered and leaking until the deployment shuts down.
+     * <p>
+     * A cycle the application already completed or dispatched owns its own ending, so a disconnect
+     * seen after that point is ignored.
+     */
+    public void onClientDisconnect() {
+        if (completed.get() || dispatchRequested.get() || finished.get()) {
+            return;
+        }
+        Callbacks cb = callbacks;
+        if (cb != null) {
+            cb.execute(this::runDisconnect);
+        } else {
+            runDisconnect();
+        }
+    }
+
+    private void runDisconnect() {
+        if (completed.get() || dispatchRequested.get() || finished.get()) {
+            return;
+        }
+        notifyError(new IOException("Client disconnected before the async cycle completed"));
+        // A listener may have dispatched in response to the error, in which case the dispatch owns
+        // the exchange from here and must not be finished out from under it.
+        if (dispatchRequested.get()) {
+            return;
+        }
+        // The connection is gone, so there is no error response to write - just fire onComplete via
+        // finishNow() and release the request state. finishNow() is idempotent.
         completed.set(true);
         cancelTimeout();
         finishNow();
