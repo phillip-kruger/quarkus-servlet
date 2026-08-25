@@ -6,17 +6,21 @@ Jakarta Servlet 6.1 implementation built directly on Vert.x 5 for Quarkus, desig
 
 **Work in progress. Not yet a drop-in replacement for `quarkus-undertow`.**
 
-The Jakarta Servlet 6.1 TCK runs with **no exclusions** and currently passes **1639 of 1714** tests
-against a real Quarkus application - see [TCK](#tck) for where the remaining 75 sit.
+The Jakarta Servlet 6.1 TCK runs with **no exclusions** and currently passes **1700 of 1714** tests
+against a real Quarkus application - see [TCK](#tck) for where the remaining 14 sit.
 
-That figure is deliberately the pessimistic one. The suite can also be driven against the servlet
-runtime as a library, where it passes 1665, and that was the number this README quoted until the
-harness was changed to boot Quarkus. It was flattering: the old harness re-implemented annotation
+That figure comes from booting a real Quarkus application, which is what ships. The suite can also
+be driven against the servlet runtime as a library, where it currently passes 1648. That harness
+once scored *higher* - 1665 against 1639 - and was the number this README quoted until the harness
+was changed to boot Quarkus. It was flattering: the old harness re-implemented annotation
 scanning, `web.xml` parsing and the entire context bootstrap in test code, so anything the harness
 did for itself was something the extension was never asked to do. Booting Quarkus for real
 immediately found seventeen gaps: two stopped an application from starting or building at all, one
 left annotation-secured servlets open to anyone, and one meant no listener declared in a deployment
-descriptor ever ran. Only the first number describes what ships.
+descriptor ever ran. Fixing those in `runtime` and `deployment` is what carried the real-application
+number past the library one, and the comparison has since inverted: at 1700 against 1648, the
+library harness is now the pessimistic measurement rather than the flattering one. Either way, only
+the real-application number describes what ships.
 
 Earlier revisions also quoted "857/857 passing"; that was the pass rate of a configuration that
 excluded async, non-blocking I/O, HTTP upgrade, multipart, security and pluggability wholesale, so
@@ -239,10 +243,11 @@ The default boots Quarkus, so the headline number measures the extension as it a
 was not always so - see [Running the TCK against a real Quarkus
 application](#running-the-tck-against-a-real-quarkus-application) for what changed and why.
 
-**Current state: 1665 of 1714 passing, 49 errors, 8 skipped.**
+**Current state: 1700 of 1714 passing, 14 errors, 8 skipped.**
 
-That figure comes from the default container, which drives the servlet runtime directly. The same
-suite run against a real Quarkus application - which is what actually ships - currently passes 1639;
+That figure comes from the default container, which boots a real Quarkus application - what actually
+ships. The same suite driven against the servlet runtime as a library
+(`-Dservlet.tck.container=direct`) currently passes 1648;
 see [Running the TCK against a real Quarkus application](#running-the-tck-against-a-real-quarkus-application)
 for why the two differ and what the gap consists of.
 
@@ -254,10 +259,13 @@ Remaining failures, all genuine gaps:
 
 | Area | Errors | Gap |
 |---|---|---|
-| `spec.security.*` | 38 | this harness runs no Quarkus security layer, so it cannot measure security at all - see below |
-| `pluggability.fragment`, `aordering*`, `spec.pluggability.ordering` | 11 | web-fragment ordering (`<absolute-ordering>`, `<ordering>`) |
-| `httpservletrequest40`, `httpservletresponse40` | 6 | HTTP request trailers |
-| assorted | 18 | spread thinly |
+| `httpservletrequest40`, `httpservletresponse40` | 3 | HTTP request trailers |
+| `httpservletrequest`, `pluggability..httpservletrequest`, `httpsessionx` | 3 | session timeout and `setMaxInactiveInterval` expiry |
+| `spec.security.secform` | 2 | **open defect**, below |
+| `spec.security.clientcert`, `clientcertanno` | 2 | harness artifact - Arquillian defines no `https` container, so the archive never deploys |
+| `servletcontext40` | 2 | listeners declared in a TLD |
+| `httpupgradehandler` | 1 | HTTP upgrade |
+| `readlistener` | 1 | non-blocking `ReadListener` input |
 
 Declarative security is implemented in the container itself (`ServletSecurityEnforcer`): BASIC
 challenges with realm handling, FORM login through `j_security_check` with saved-request replay and
@@ -339,7 +347,7 @@ them to application classes instead gives two definitions of `jakarta.servlet.Ge
 in the application classloader and one in its parent, and the deployment then fails with
 `NoClassDefFoundError` naming a class that is demonstrably loadable.
 
-**Current state: 1639 of 1714 passing, 75 errors.**
+**Current state: 1700 of 1714 passing, 14 errors.**
 
 #### Why the application model is built by hand
 
@@ -427,8 +435,8 @@ application found seventeen such gaps, every one of which would have hit a real 
 | Servlets registered after the boot-time pass had no instance | 500 on first use, via forward or lazy init |
 
 All seventeen are fixed in `runtime` and `deployment` rather than in the harness, which took this
-container from **957 errors to 75** of 1714. Fragment support and the context lifecycle account
-for most of it - the `pluggability` package alone went from 641 errors to 94 - and not one of the
+container from **957 errors to 14** of 1714. Fragment support and the context lifecycle account
+for most of it - the `pluggability` package alone went from 641 errors to 1 - and not one of the
 seventeen cost the direct container a single test, which is precisely the point: they were
 invisible to it.
 
@@ -436,13 +444,13 @@ What is still outstanding here, worst first:
 
 | Area | Errors | Gap |
 |---|---|---|
-| `spec.security.secform` | 15 | **open defect**, below |
-| `spec.async` | 9 | async dispatch edges |
-| `servletcontext*` (four suites) | 10 | assorted context API |
-| `spec.security` other | 7 | `<deny-uncovered-http-methods>`, client-cert |
-| `httpservletrequest40`, `httpservletresponse40` | 6 | HTTP request trailers, blocked on Vert.x |
-| `pluggability.fragment` | 3 | web-fragment ordering |
-| remainder | ~25 | spread thinly, one or two per suite |
+| `httpservletrequest40`, `httpservletresponse40` | 3 | HTTP request trailers, blocked on Vert.x |
+| `httpservletrequest`, `pluggability..httpservletrequest`, `httpsessionx` | 3 | session timeout and `setMaxInactiveInterval` expiry |
+| `spec.security.secform` | 2 | **open defect**, below |
+| `spec.security.clientcert`, `clientcertanno` | 2 | harness artifact - Arquillian defines no `https` container |
+| `servletcontext40` | 2 | listeners declared in a TLD |
+| `httpupgradehandler` | 1 | HTTP upgrade |
+| `readlistener` | 1 | non-blocking `ReadListener` input |
 
 **The open defect in `secform`.** FORM login itself works: the caller is redirected to the login
 page, posts to `j_security_check`, and is redirected back to the page originally requested. The
@@ -454,10 +462,10 @@ provider (`ElytronTrustedIdentityProvider` is present and reached).
 
 These numbers are the honest measure of the extension as shipped.
 
-Fragment support has one known limit: `<absolute-ordering>` and `<ordering>` are not implemented,
-so fragments merge in the order their archives are visited. That decides which declaration wins
-when two fragments configure the same name; it does not affect whether a fragment deploys. web.xml
-still takes precedence over every fragment, which is enforced explicitly.
+Fragment ordering is now implemented: `<absolute-ordering>` in web.xml (Servlet 6.1 section 8.2.2)
+and relative `<ordering>` in the fragments themselves both apply, and fragments excluded by an
+absolute ordering are kept out of annotation scanning as well. web.xml still takes precedence over
+every fragment, which is enforced explicitly.
 
 ### Baseline: what the Undertow engine scores
 
@@ -479,7 +487,7 @@ mvn verify -Dtck-undertow -pl tck-undertow      # same 6.1.2 TCK, no exclusions
 
 | Implementation | Result | Pass rate |
 |---|---|---|
-| quarkus-servlet (this extension, real Quarkus app) | **1639 / 1714** | 95.6% |
+| quarkus-servlet (this extension, real Quarkus app) | **1700 / 1714** | 99.2% |
 | quarkus-undertow (Undertow engine, `tck-undertow`) | **1541 / 1714** | 89.9% |
 
 Of the 165 errors, 12 are a harness artifact - `ServletContext40Tests` injects an
