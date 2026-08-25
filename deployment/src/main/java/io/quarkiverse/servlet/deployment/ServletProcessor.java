@@ -860,8 +860,21 @@ public class ServletProcessor {
             BuildProducer<RouteBuildItem> routes,
             ShutdownContextBuildItem shutdown) {
 
+        // Listeners the descriptor declared are registered first, and those it did not - a TLD's -
+        // after them. A TLD listener is an addition to a deployment that is otherwise complete, so
+        // it must not run before the listeners that deployment declared: those establish the state
+        // it observes, and reversing the two has it looking at a context that is not yet set up.
         for (ListenerBuildItem l : listenerItems) {
-            recorder.registerListener(deploymentBuildItem.getDeployment(), l.getListenerClass());
+            if (!l.isRestricted()) {
+                recorder.registerListener(deploymentBuildItem.getDeployment(), l.getListenerClass(),
+                        false);
+            }
+        }
+        for (ListenerBuildItem l : listenerItems) {
+            if (l.isRestricted()) {
+                recorder.registerListener(deploymentBuildItem.getDeployment(), l.getListenerClass(),
+                        true);
+            }
         }
 
         recorder.setupSecurityPolicy(deploymentBuildItem.getDeployment());

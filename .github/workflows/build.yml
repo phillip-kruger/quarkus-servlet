@@ -73,4 +73,4 @@ jobs:
       # matters as much as the first: a fork that dies partway through reports fewer errors purely
       # because it ran fewer tests, which without a count check reads as an improvement.
       - name: Check for regressions
-        run: ./.github/check-tck-errors.sh 14 1714
+        run: ./.github/check-tck-errors.sh 10 1714

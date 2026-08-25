@@ -6,11 +6,11 @@ Jakarta Servlet 6.1 implementation built directly on Vert.x 5 for Quarkus, desig
 
 **Work in progress. Not yet a drop-in replacement for `quarkus-undertow`.**
 
-The Jakarta Servlet 6.1 TCK runs with **no exclusions** and currently passes **1700 of 1714** tests
-against a real Quarkus application - see [TCK](#tck) for where the remaining 14 sit.
+The Jakarta Servlet 6.1 TCK runs with **no exclusions** and currently passes **1704 of 1714** tests
+against a real Quarkus application - see [TCK](#tck) for where the remaining 10 sit.
 
 That figure comes from booting a real Quarkus application, which is what ships. The suite can also
-be driven against the servlet runtime as a library, where it currently passes 1648. That harness
+be driven against the servlet runtime as a library, where it currently passes 1650. That harness
 once scored *higher* - 1665 against 1639 - and was the number this README quoted until the harness
 was changed to boot Quarkus. It was flattering: the old harness re-implemented annotation
 scanning, `web.xml` parsing and the entire context bootstrap in test code, so anything the harness
@@ -18,7 +18,7 @@ did for itself was something the extension was never asked to do. Booting Quarku
 immediately found seventeen gaps: two stopped an application from starting or building at all, one
 left annotation-secured servlets open to anyone, and one meant no listener declared in a deployment
 descriptor ever ran. Fixing those in `runtime` and `deployment` is what carried the real-application
-number past the library one, and the comparison has since inverted: at 1700 against 1648, the
+number past the library one, and the comparison has since inverted: at 1704 against 1650, the
 library harness is now the pessimistic measurement rather than the flattering one. Either way, only
 the real-application number describes what ships.
 
@@ -243,11 +243,11 @@ The default boots Quarkus, so the headline number measures the extension as it a
 was not always so - see [Running the TCK against a real Quarkus
 application](#running-the-tck-against-a-real-quarkus-application) for what changed and why.
 
-**Current state: 1700 of 1714 passing, 14 errors, 8 skipped.**
+**Current state: 1704 of 1714 passing, 10 errors, 8 skipped.**
 
 That figure comes from the default container, which boots a real Quarkus application - what actually
 ships. The same suite driven against the servlet runtime as a library
-(`-Dservlet.tck.container=direct`) currently passes 1648;
+(`-Dservlet.tck.container=direct`) currently passes 1650;
 see [Running the TCK against a real Quarkus application](#running-the-tck-against-a-real-quarkus-application)
 for why the two differ and what the gap consists of.
 
@@ -259,11 +259,10 @@ Remaining failures, all genuine gaps:
 
 | Area | Errors | Gap |
 |---|---|---|
-| `httpservletrequest40`, `httpservletresponse40` | 3 | HTTP request trailers |
-| `httpservletrequest`, `pluggability..httpservletrequest`, `httpsessionx` | 3 | session timeout and `setMaxInactiveInterval` expiry |
+| `httpservletrequest40`, `httpservletresponse40` | 3 | HTTP request trailers, blocked on Vert.x |
 | `spec.security.secform` | 2 | **open defect**, below |
-| `spec.security.clientcert`, `clientcertanno` | 2 | harness artifact - Arquillian defines no `https` container, so the archive never deploys |
-| `servletcontext40` | 2 | listeners declared in a TLD |
+| `spec.security.clientcert`, `clientcertanno` | 2 | harness - Arquillian defines no `https` container, and passing needs TLS with `CLIENT-CERT` mapped to an identity |
+| `httpsessionx` | 1 | a two-WAR test whose second deployment is not reached - see below |
 | `httpupgradehandler` | 1 | HTTP upgrade |
 | `readlistener` | 1 | non-blocking `ReadListener` input |
 
@@ -347,7 +346,7 @@ them to application classes instead gives two definitions of `jakarta.servlet.Ge
 in the application classloader and one in its parent, and the deployment then fails with
 `NoClassDefFoundError` naming a class that is demonstrably loadable.
 
-**Current state: 1700 of 1714 passing, 14 errors.**
+**Current state: 1704 of 1714 passing, 10 errors.**
 
 #### Why the application model is built by hand
 
@@ -435,8 +434,8 @@ application found seventeen such gaps, every one of which would have hit a real 
 | Servlets registered after the boot-time pass had no instance | 500 on first use, via forward or lazy init |
 
 All seventeen are fixed in `runtime` and `deployment` rather than in the harness, which took this
-container from **957 errors to 14** of 1714. Fragment support and the context lifecycle account
-for most of it - the `pluggability` package alone went from 641 errors to 1 - and not one of the
+container from **957 errors to 10** of 1714. Fragment support and the context lifecycle account
+for most of it - the `pluggability` package alone went from 641 errors to none - and not one of the
 seventeen cost the direct container a single test, which is precisely the point: they were
 invisible to it.
 
@@ -445,12 +444,18 @@ What is still outstanding here, worst first:
 | Area | Errors | Gap |
 |---|---|---|
 | `httpservletrequest40`, `httpservletresponse40` | 3 | HTTP request trailers, blocked on Vert.x |
-| `httpservletrequest`, `pluggability..httpservletrequest`, `httpsessionx` | 3 | session timeout and `setMaxInactiveInterval` expiry |
 | `spec.security.secform` | 2 | **open defect**, below |
-| `spec.security.clientcert`, `clientcertanno` | 2 | harness artifact - Arquillian defines no `https` container |
-| `servletcontext40` | 2 | listeners declared in a TLD |
+| `spec.security.clientcert`, `clientcertanno` | 2 | harness - Arquillian defines no `https` container, and passing needs TLS with `CLIENT-CERT` mapped to an identity |
+| `httpsessionx` | 1 | a two-WAR test whose second deployment is not reached - see below |
 | `httpupgradehandler` | 1 | HTTP upgrade |
 | `readlistener` | 1 | non-blocking `ReadListener` input |
+
+**The two-WAR test in `httpsessionx`.** `expireHttpSessionxTest` deploys two applications and
+drives the second one. The request comes back `404` for a path that deployment does map, so the
+client is reaching the wrong application: the first WAR maps only `/TestServlet/*` and would answer
+exactly that way. This is the harness rather than the runtime - a deployment Arquillian addresses
+by name has to be given back the URL belonging to that name - and it is the last of the errors
+that is not either blocked upstream or a known defect.
 
 **The open defect in `secform`.** FORM login itself works: the caller is redirected to the login
 page, posts to `j_security_check`, and is redirected back to the page originally requested. The
@@ -461,6 +466,13 @@ received`, so it expects the redirect Quarkus performs), and it is not a missing
 provider (`ElytronTrustedIdentityProvider` is present and reached).
 
 These numbers are the honest measure of the extension as shipped.
+
+Listeners declared in a TLD are registered too. A tag library may carry `<listener>` entries
+(Jakarta Pages 3.1 section 7.3.1) and a container has to honour them whether or not it implements
+Pages, so that dropping a jar on the classpath is enough to install its listeners. They are
+registered after the ones the deployment descriptor declares, and are restricted the way Servlet
+6.1 section 4.4 restricts any listener the descriptor did not declare: they may not add servlets,
+filters or listeners, and may not reconfigure the context.
 
 Fragment ordering is now implemented: `<absolute-ordering>` in web.xml (Servlet 6.1 section 8.2.2)
 and relative `<ordering>` in the fragments themselves both apply, and fragments excluded by an
@@ -487,7 +499,7 @@ mvn verify -Dtck-undertow -pl tck-undertow      # same 6.1.2 TCK, no exclusions
 
 | Implementation | Result | Pass rate |
 |---|---|---|
-| quarkus-servlet (this extension, real Quarkus app) | **1700 / 1714** | 99.2% |
+| quarkus-servlet (this extension, real Quarkus app) | **1704 / 1714** | 99.4% |
 | quarkus-undertow (Undertow engine, `tck-undertow`) | **1541 / 1714** | 89.9% |
 
 Of the 165 errors, 12 are a harness artifact - `ServletContext40Tests` injects an
