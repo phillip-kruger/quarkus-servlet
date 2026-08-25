@@ -32,3 +32,6 @@ Thumbs.db
 
 # Jackknife
 .jackknife/
+
+# Cachebro
+.cachebro/

@@ -1,0 +1,76 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # This extension builds against Quarkus main, which is not published anywhere. The
+      # annotation processor has to be installed before the rest of the tree, because processor
+      # paths resolve from the repository rather than the reactor.
+      - name: Check out Quarkus
+        uses: actions/checkout@v4
+        with:
+          repository: quarkusio/quarkus
+          path: quarkus
+
+      - name: Build Quarkus
+        working-directory: quarkus
+        run: |
+          ./mvnw -B -Dquickly -pl core/processor -am
+          ./mvnw -B -Dquickly -T8 -Dno-test-modules
+
+      - name: Build and test
+        run: ./mvnw -B verify
+
+  tck:
+    name: Servlet TCK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Check out Quarkus
+        uses: actions/checkout@v4
+        with:
+          repository: quarkusio/quarkus
+          path: quarkus
+
+      - name: Build Quarkus
+        working-directory: quarkus
+        run: |
+          ./mvnw -B -Dquickly -pl core/processor -am
+          ./mvnw -B -Dquickly -T8 -Dno-test-modules
+
+      - name: Install the extension
+        run: ./mvnw -B install -DskipTests
+
+      # The TCK runs with no exclusions, so it does not pass yet. Failing the job on a red suite
+      # would mean a permanently red build that everyone learns to ignore. The check below fails
+      # only when the number of errors goes up, which is the thing worth catching.
+      - name: Run the TCK
+        run: ./mvnw -B verify -Dtck -pl tck || true
+
+      # Arguments are the error baseline and the number of tests the suite must run. The second
+      # matters as much as the first: a fork that dies partway through reports fewer errors purely
+      # because it ran fewer tests, which without a count check reads as an improvement.
+      - name: Check for regressions
+        run: ./.github/check-tck-errors.sh 75 1714
