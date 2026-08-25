@@ -14,6 +14,7 @@ import java.util.Enumeration;
 import java.util.EventListener;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -58,6 +59,9 @@ public class VertxServletContext implements ServletContext {
     private ServletDeployment deployment;
     private boolean initializing;
     private boolean restrictedContext;
+    /** Identity-based: two listener instances of the same class are distinct registrations. */
+    private final Set<EventListener> restrictedListeners = Collections
+            .newSetFromMap(new IdentityHashMap<>());
     private boolean inListenerContext;
     private final Map<String, SimpleServletRegistration> servletRegistrations = new LinkedHashMap<>();
     private final Map<String, SimpleFilterRegistration> filterRegistrations = new LinkedHashMap<>();
@@ -115,7 +119,26 @@ public class VertxServletContext implements ServletContext {
     }
 
     public void addRegisteredListener(EventListener listener) {
+        addRegisteredListener(listener, false);
+    }
+
+    /**
+     * Registers a listener, recording whether it is one the deployment descriptor never declared.
+     * Such a listener is restricted by Servlet 6.1 section 4.4 in the same way a programmatically
+     * added one is, but it cannot be recognised by its position in the list the way those are -
+     * it is registered at build time, before the boundary between declared and programmatic
+     * listeners is drawn - so the classification has to be carried explicitly.
+     */
+    public void addRegisteredListener(EventListener listener, boolean restricted) {
         listeners.add(listener);
+        if (restricted) {
+            restrictedListeners.add(listener);
+        }
+    }
+
+    /** Whether this listener may not register anything or reconfigure the context. */
+    public boolean isRestrictedListener(EventListener listener) {
+        return restrictedListeners.contains(listener);
     }
 
     public List<EventListener> getListeners() {

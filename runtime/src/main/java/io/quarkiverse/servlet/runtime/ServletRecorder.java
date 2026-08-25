@@ -153,6 +153,11 @@ public class ServletRecorder {
     }
 
     public void registerListener(RuntimeValue<ServletDeployment> deployment, String className) {
+        registerListener(deployment, className, false);
+    }
+
+    public void registerListener(RuntimeValue<ServletDeployment> deployment, String className,
+            boolean restricted) {
         try {
             Class<?> clazz = Thread.currentThread().getContextClassLoader().loadClass(className);
             Object instance = Arc.container().instance(clazz).get();
@@ -160,7 +165,7 @@ public class ServletRecorder {
                 instance = clazz.getDeclaredConstructor().newInstance();
             }
             deployment.getValue().getServletContext()
-                    .addRegisteredListener((java.util.EventListener) instance);
+                    .addRegisteredListener((java.util.EventListener) instance, restricted);
             log.debugf("Registered listener: %s", className);
         } catch (Exception e) {
             throw new RuntimeException("Failed to register listener: " + className, e);
@@ -293,8 +298,11 @@ public class ServletRecorder {
             ServletContextEvent event = new ServletContextEvent(servletContext);
             for (int i = 0; i < listeners.size(); i++) {
                 if (listeners.get(i) instanceof ServletContextListener listener) {
+                    // Position identifies the listeners added during this phase; the explicit flag
+                    // covers those registered at build time that the descriptor never declared,
+                    // such as a listener found in a TLD, which sit below the boundary.
                     notifyContextInitialized(servletContext, listener, event,
-                            i >= declaredListenerCount);
+                            i >= declaredListenerCount || servletContext.isRestrictedListener(listener));
                 }
             }
 
